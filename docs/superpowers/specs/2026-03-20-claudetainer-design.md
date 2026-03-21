@@ -1,53 +1,53 @@
 # Claudetainer: Interactive Claude Code Development Environment
 
-A Docker container deployed to Fly.io that provides a persistent, interactive Claude Code environment accessible via SSH. The container runs Claude Code with a layered security model: an immutable base image, a non-root user, network-level domain enforcement via iptables, and a command-level approval hook. A secret-holding sidecar ensures API keys are never exposed to Claude's environment.
+A Docker container deployed to Fly.io that provides a persistent, interactive Claude Code environment accessible via SSH. The container runs Claude Code with a three-layer security model: an immutable base image with non-root user, network-level domain enforcement via iptables + CoreDNS, and a command-level approval hook. Claude Code authenticates via interactive OAuth login (no API key). GitHub access uses a fine-grained PAT stored in root-owned config files.
 
 ## Architecture Overview
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ Fly Machine (shared-cpu-1x, 1GB)                           │
+│ Fly Machine (shared-cpu-1x, 1GB)                             │
 │                                                              │
 │  entrypoint.sh (runs as root)                                │
 │    ├── configure iptables (OUTPUT DROP default)              │
-│    ├── configure git identity                                │
-│    ├── install superpowers plugin                             │
-│    ├── substitute secrets into settings                      │
+│    ├── start CoreDNS (allowlisted domains only)              │
+│    ├── configure git identity + PAT                          │
+│    ├── start approval daemon                                 │
 │    └── drop to claude user → start tmux                      │
 │                                                              │
-│  ┌─────────────────────────────────┐  ┌───────────────────┐  │
-│  │ Claude's Environment            │  │ Auth Sidecar      │  │
-│  │ (user: claude, non-root)        │  │ (runs as root)    │  │
-│  │                                 │  │                   │  │
-│  │  Read-only root filesystem      │  │ Reverse proxy     │  │
-│  │  Writable: /workspace           │  │ that injects:     │  │
-│  │           /tmp                  │  │  - ANTHROPIC key  │  │
-│  │           /home/claude/.cache   │  │  - GitHub PAT     │  │
-│  │                                 │  │                   │  │
-│  │  tmux session "claude"          │  │ Listens on        │  │
-│  │  ├── claude --skip-perms        │  │ 127.0.0.1:4111    │  │
-│  │  │   ├── PreToolUse hook        │  │                   │  │
-│  │  │   │   └── check-command.sh   │  │ Claude sees:      │  │
-│  │  │   │       └── rules.conf     │  │ ANTHROPIC_API_URL │  │
-│  │  │   └── MCP servers            │  │ = localhost:4111  │  │
-│  │  │       ├── GitHub             │  │                   │  │
-│  │  │       └── Bun docs           │  └───────────────────┘  │
-│  │  │                              │                         │
-│  │  Capabilities: NONE             │  iptables (immutable):  │
-│  │  no-new-privileges: true        │  ├── OUTPUT DROP (dflt) │
-│  │  seccomp: restricted            │  ├── ACCEPT → sidecar   │
-│  │                                 │  ├── ACCEPT → github    │
-│  └─────────────────────────────────┘  ├── ACCEPT → DNS       │
-│                                       └── ACCEPT → ESTAB     │
+│  ┌──────────────────────────────────────────────────────┐    │
+│  │ Claude's Environment (user: claude, non-root)        │    │
+│  │                                                      │    │
+│  │  Read-only root filesystem                           │    │
+│  │  Writable: /workspace, /tmp, ~/.cache, ~/.claude     │    │
+│  │                                                      │    │
+│  │  tmux session "claude"                               │    │
+│  │  ├── claude --dangerously-skip-permissions            │    │
+│  │  │   ├── PreToolUse hook (check-command.sh)          │    │
+│  │  │   │   └── reads rules.conf                        │    │
+│  │  │   └── MCP: Bun docs                               │    │
+│  │  │                                                    │    │
+│  │  Capabilities: NONE                                   │    │
+│  │  no-new-privileges: true                              │    │
+│  │  seccomp: restricted                                  │    │
+│  └──────────────────────────────────────────────────────┘    │
+│                                                              │
+│  iptables (set by root, immutable to claude):                │
+│  ├── OUTPUT DROP (default)                                   │
+│  ├── ACCEPT → allowlisted domain IPs                         │
+│  ├── ACCEPT → CoreDNS (127.0.0.53)                           │
+│  ├── ACCEPT → loopback                                       │
+│  ├── DROP → metadata, private net, UDP, IPv6                 │
+│  └── ACCEPT → ESTABLISHED                                    │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
         ▲
         │ fly ssh console → tmux attach
         │
-    Developer
+    Developer (authenticates Claude Code via OAuth on first use)
 ```
 
-## Security Model: Four Layers
+## Security Model: Three Layers
 
 ### Layer 1: Container Hardening (tamper-proof enforcement)
 
@@ -262,33 +262,9 @@ Approvals are **one-shot**: each token is consumed on use. Approving `bun add re
 
 **Why this works with Layer 2:** The iptables allowlist permits traffic to package registries, but the hook gates which install commands actually run. Claude can't bypass the hook to run `bun add evil-package` because the hook fires on every Bash tool invocation even in `--dangerously-skip-permissions` mode. The two layers complement: iptables blocks unknown domains, the hook blocks unapproved commands to known domains.
 
-### Layer 4: Secret-Holding Sidecar (credential isolation)
+### Credential Management
 
-Claude never sees API keys directly. A lightweight reverse proxy sidecar holds secrets and injects them into outbound API requests.
-
-**Sidecar architecture:**
-
-The sidecar is a lightweight reverse proxy (~100-200 lines, written in Go using `httputil.ReverseProxy` or similar well-audited library). It runs as root (separate from Claude's process) and exposes two endpoints:
-
-- `127.0.0.1:4111` → proxies to `api.anthropic.com` (injects `ANTHROPIC_API_KEY`)
-  - Only allows `POST /v1/messages` and `POST /v1/complete` — rejects all other paths
-- `127.0.0.1:4112` → proxies to `api.githubcopilot.com` (injects `Authorization: Bearer <GH_PAT>`)
-  - Only allows the MCP endpoint pattern — rejects all other paths
-
-**Request origin validation:** The sidecar uses a per-session bearer token generated at startup and written only to Claude Code's config (settings.json on the tmpfs mount). The sidecar rejects any request that doesn't include this token in a custom header (`X-Claudetainer-Token`). This prevents Python, Bun, or other runtimes from directly calling the sidecar to gain credential injection — only Claude Code (which reads the token from settings.json) can authenticate. The token is a random 256-bit value regenerated on every container start.
-
-The sidecar must handle SSE streaming (Anthropic API responses are server-sent events) and TLS to upstream. All requests are logged to stdout (viewable via `fly logs`). Rate-limiting is applied to detect abuse patterns.
-
-If the sidecar crashes, Claude Code gets `connection refused` — **fail-closed**. The sidecar and approval daemon are supervised by a simple bash restart loop in the entrypoint, ensuring they are automatically restarted if they crash.
-
-Claude's environment sees:
-- `ANTHROPIC_API_BASE_URL=http://127.0.0.1:4111` — points to the sidecar, not the real API
-- No `ANTHROPIC_API_KEY` in the environment
-- No `GH_PAT` in the environment
-- No `GH_TOKEN` in the environment
-- Git credential helper configured by root (stored in `/root/.git-credentials`, unreadable by `claude`)
-- `gh` CLI reads auth from `/root/.config/gh/hosts.yml` (root-owned, unreadable by `claude`)
-- GitHub MCP server URL points to `http://127.0.0.1:4112/mcp/` — sidecar injects the PAT
+**Claude Code authentication:** Claude Code uses interactive OAuth login. The user authenticates on first use after each container start. OAuth tokens are stored by Claude Code in `/home/claude/.claude/` (tmpfs) — they persist for the session but are lost on container restart, requiring re-authentication.
 
 **Git credential isolation:**
 
@@ -300,13 +276,11 @@ git config --system credential.helper 'store --file=/root/.git-credentials'
 
 The `claude` user can run `git clone/push/pull` and git transparently authenticates, but Claude cannot read the credential file or extract the PAT.
 
-**MCP server authentication:**
+**gh CLI authentication:**
 
-The GitHub MCP server is also routed through the sidecar. The sidecar exposes a second endpoint (`127.0.0.1:4112`) that proxies to `api.githubcopilot.com` and injects the `Authorization: Bearer <GH_PAT>` header. Claude's settings.json points the GitHub MCP server URL to `http://127.0.0.1:4112/mcp/` — Claude never sees the PAT value.
+The entrypoint configures `gh` auth writing to `/opt/gh-config/hosts.yml` (root-owned directory, mode 711; file mode 644). `GH_CONFIG_DIR=/opt/gh-config` is set in Claude's environment. Since `gh api` is hard-blocked and the PAT is fine-grained with minimal permissions, the token being readable via `gh config` is an accepted risk — Claude cannot exfiltrate it to non-allowlisted domains.
 
-The `GH_PAT` is scoped to the robot GitHub account with minimum necessary permissions (repo read/write for specific repos, no admin access). Even so, by routing through the sidecar, the PAT cannot be exfiltrated from Claude's environment.
-
-**What this eliminates:** API key exfiltration. Even if Claude is fully compromised, the Anthropic API key cannot be extracted — it exists only in the sidecar's process memory and the Fly secret store.
+**What's NOT in Claude's environment:** No `ANTHROPIC_API_KEY`, no `GH_PAT`, no `GH_TOKEN`. The PAT is accessible only via root-owned git credential store and gh config. The Anthropic API is accessed via OAuth tokens managed by Claude Code itself.
 
 ## Container Image
 
@@ -335,7 +309,6 @@ All install scripts fetched at build time (`curl | bash` for Claude Code, Bun) a
 Contents:
 - **PreToolUse hook** pointing to `/opt/approval/check-command.sh`
 - **MCP servers:**
-  - GitHub: `http://127.0.0.1:4112/mcp/` (proxied through sidecar, no credentials in config)
   - Bun docs: `https://bun.com/docs/mcp`
 
 ### Superpowers Plugin
@@ -355,8 +328,9 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
 
 | Secret | Purpose |
 |--------|---------|
-| `ANTHROPIC_API_KEY` | Held by sidecar only, never exposed to Claude |
-| `GH_PAT` | Git HTTPS auth, gh CLI, GitHub MCP server — all via root-owned config, never in Claude's environment |
+| `GH_PAT` | Git HTTPS auth, gh CLI — stored in root-owned config files, never in Claude's environment |
+
+Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactive OAuth login on first use.
 
 **GitHub PAT scope:** Use a **fine-grained personal access token** (not classic) scoped to specific repositories only:
 
@@ -393,14 +367,12 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
    - Write `$GH_PAT` to `/root/.git-credentials` (root-owned, mode 600)
    - Configure git system-wide credential helper pointing to that file
    - Set git identity from `$GIT_AUTHOR_NAME` / `$GIT_AUTHOR_EMAIL` env vars
-3. **Sidecar startup:**
-   - Start the auth sidecar proxy:
-     - `127.0.0.1:4111` → proxies to `api.anthropic.com` (injects `ANTHROPIC_API_KEY`)
-     - `127.0.0.1:4112` → proxies to `api.githubcopilot.com` (injects `GH_PAT`)
-   - Start the approval daemon on Unix socket `/run/claude-approval.sock`
+   - Configure `gh` CLI auth: `echo "$GH_PAT" | gh auth login --with-token` writing to `/opt/gh-config/hosts.yml` (root-owned directory, mode 711; file mode 644). Set `GH_CONFIG_DIR=/opt/gh-config` in Claude's environment.
+   - Configure npm/bun auth for GitHub Packages: write `.npmrc` with `//npm.pkg.github.com/:_authToken=${GH_PAT}` to `/home/claude/.npmrc` (root-owned, mode 644)
+3. **Approval daemon startup:**
+   - Start the approval daemon on Unix socket `/run/claude-approval.sock` (supervised restart loop)
 4. **Claude Code setup:**
    - Copy settings template from `/opt/claude/settings.json` to `/home/claude/.claude/settings.json` (tmpfs, root-owned, mode 644 — Claude can read but not modify, preventing hook removal mid-session)
-   - Configure `gh` CLI auth: `echo "$GH_PAT" | gh auth login --with-token` writing to `/opt/gh-config/hosts.yml` (root-owned directory, mode 711; file mode 644 so `claude` can read config but the token is embedded). Set `GH_CONFIG_DIR=/opt/gh-config` in Claude's environment. Note: since `gh api` is hard-blocked and the PAT is scoped to specific repos with minimal permissions, the token being readable via `gh config` is an accepted risk — Claude cannot exfiltrate it to non-allowlisted domains, and the `default:block` policy prevents using arbitrary commands to read it. The primary secrets (Anthropic API key) are fully isolated in the sidecar.
    - Install superpowers plugin (log warning on failure)
 5. **Session startup:**
    - Start tmux session as `claude` user with `remain-on-exit on`
@@ -452,8 +424,6 @@ claudetainer/
 │   └── workflows/
 │       └── deploy.yml
 ├── entrypoint.sh
-├── sidecar/
-│   └── auth-proxy            # Reverse proxy: injects API keys into requests
 ├── approval/
 │   ├── check-command.sh       # PreToolUse hook script
 │   ├── rules.conf             # Configurable allow/approve/block patterns
@@ -461,29 +431,29 @@ claudetainer/
 │   └── approval-daemon        # Root-owned daemon: manages approval tokens
 ├── network/
 │   ├── domains.conf           # Domain allowlist (one per line, shared by iptables + CoreDNS)
-│   ├── Corefile                # CoreDNS config: only resolves allowlisted domains
+│   ├── Corefile.template      # CoreDNS config template: base with NXDOMAIN default
 │   └── refresh-iptables.sh    # Cron script: re-resolves domains, atomic iptables-restore
-├── status                     # CLI tool: shows active approvals, recent blocks, sidecar health
-├── seccomp-profile.json       # Seccomp policy (blocks bpf, mount, ptrace, etc.)
-└── claude-settings.json       # Claude Code settings template (no secrets)
+├── status                     # CLI tool: shows active approvals, recent blocks, daemon health
+├── seccomp-profile.json       # Seccomp policy (extends Docker default)
+└── claude-settings.json       # Claude Code settings template (hook config + MCP)
 ```
 
 | File | Purpose |
 |------|---------|
 | `Dockerfile` | Image build: Bun, Python, CLI tools, Claude Code, non-root user, read-only FS |
-| `fly.toml` | Fly app config: app name, region, machine size |
+| `fly.toml` | Fly app config: app name, region, machine size, no exposed ports |
 | `deploy.yml` | GitHub Action: build → push to GHCR → deploy to Fly |
-| `entrypoint.sh` | Container startup: iptables, git config, sidecar, approval daemon, tmux |
-| `auth-proxy` | Sidecar: proxies Anthropic API (:4111) and GitHub MCP (:4112), injects keys |
-| `check-command.sh` | PreToolUse hook: reads rules.conf, enforces command tiers |
+| `entrypoint.sh` | Container startup: network lockdown, git config, approval daemon, tmux |
+| `check-command.sh` | PreToolUse hook: reads rules.conf, splits compounds, enforces tiers |
 | `rules.conf` | Configurable allow/approve/block regex patterns for Bash commands |
 | `approve` | CLI tool: sends approval hash to daemon via Unix socket |
 | `approval-daemon` | Root-owned: listens on Unix socket, writes tokens to root-owned directory |
-| `domains.conf` | Network allowlist: domains whose IPs are permitted through iptables |
+| `domains.conf` | Domain allowlist: shared by iptables + CoreDNS |
+| `Corefile.template` | CoreDNS base config; entrypoint generates final Corefile from domains.conf |
 | `refresh-iptables.sh` | Cron job (every 30m): re-resolves domains, atomic `iptables-restore` |
-| `status` | CLI tool: shows active approvals, recent blocks, sidecar health |
-| `seccomp-profile.json` | Kernel syscall restrictions (blocks bpf, mount, ptrace, etc.) |
-| `claude-settings.json` | Claude Code settings template: hook config + MCP servers (no secrets) |
+| `status` | CLI tool: shows active approvals, recent blocks, daemon health |
+| `seccomp-profile.json` | Extends Docker default seccomp + blocks bpf/mount/ptrace/unshare/setns |
+| `claude-settings.json` | Claude Code settings template: hook config + Bun docs MCP |
 
 ## Observability & Audit Trail
 
@@ -491,11 +461,9 @@ claudetainer/
 
 **iptables logging:** Dropped packets are logged with the prefix `CLAUDETAINER_DROP:` (rate-limited to 5/min to prevent log flooding). Viewable via `fly logs` or `dmesg`.
 
-**Sidecar logging:** All proxied requests are logged to stdout with timestamp, method, path, and response status. Viewable via `fly logs`.
-
 **Approval logging:** The approval daemon logs all approval requests (who approved what, when) to stdout.
 
-**Monitoring command:** Users can run `! status` (a script at `/usr/local/bin/status`) to see: active approval tokens, recent blocked commands, recent iptables drops, sidecar health.
+**Monitoring command:** Users can run `! status` (a script at `/usr/local/bin/status`) to see: active approval tokens, recent blocked commands, recent iptables drops, approval daemon health.
 
 ## Operational Security Notes
 
@@ -503,7 +471,7 @@ claudetainer/
 - **tmux hygiene:** Users should not type secrets in the Claude tmux session. Tmux scrollback could be read by Claude via `tmux capture-pane` (which is hard-blocked in rules.conf).
 - **CI/CD token rotation:** The `FLY_API_TOKEN` GitHub secret should be rotated regularly. If compromised, an attacker can deploy arbitrary images. Consider OIDC federation if Fly supports it.
 - **Claude-authored PRs:** All commits use the robot git identity. Require human code review for all merges — no auto-merge. Human code review is a **critical security boundary**, not optional — Claude can write arbitrary code to `/workspace`, and review is the last line of defense before that code runs in unrestricted environments.
-- **No published ports:** The `fly.toml` must not contain a `[services]` or `[[services]]` block. No ports should be exposed to the internet. The sidecar endpoints (`:4111`, `:4112`) must only be accessible on localhost.
+- **No published ports:** The `fly.toml` must not contain a `[services]` or `[[services]]` block. No ports should be exposed to the internet.
 - **Fly private networking:** iptables blocks Fly's internal network ranges (`fdaa::/16`, `172.16.0.0/12`) to prevent lateral movement to other machines in the same org.
 
 ## Emergency Procedures
@@ -511,7 +479,7 @@ claudetainer/
 **Kill switch:** If suspicious behavior is detected:
 1. `fly machine stop <machine-id>` — immediately stops the VM, killing all processes
 2. Alternatively from inside the session: `kill -9 -1` as root kills all UID 1000 processes
-3. The ephemeral workspace is lost, but `fly logs` retains hook/sidecar/iptables audit logs for forensic review
+3. The ephemeral workspace is lost, but `fly logs` retains hook/iptables/approval audit logs for forensic review
 
 **Session recording:** tmux is configured to log all pane output to `/tmp/tmux-session.log`. This file is on tmpfs (lost on restart) but provides a forensic trail during the session. For persistent session recording, pipe `fly logs` to an external log aggregator.
 
@@ -528,11 +496,10 @@ claudetainer/
 | Claude uses `env` or `cat /proc/` to read secrets | `env` (bare) blocked; `/proc/` blocked anywhere in command; no secrets in Claude's env |
 | Claude uses `env VAR=val cmd` to bypass hook | `env` with arguments falls to default:block (no allow rule for env) |
 | Claude reaches other Fly machines | Fly private network ranges (fdaa::/16, 172.16.0.0/12) blocked in iptables |
-| Claude exfiltrates API keys | Sidecar holds keys, never in Claude's environment or config files |
-| Claude exfiltrates GitHub PAT | PAT readable via gh config but scoped to specific repos; gh api/gist blocked; can't reach non-allowlisted domains |
-| Claude reads secrets from /proc | No high-value secrets in Claude's environment; Anthropic key fully isolated in sidecar |
-| Claude calls sidecar directly (Python/Bun) | Sidecar requires per-session bearer token only known to Claude Code (via settings.json) |
-| Claude self-approves via socket | Approval daemon checks `SO_PEERCRED` — rejects UID 1000 (claude), only accepts UID 0 (root) |
+| Claude exfiltrates Anthropic credentials | Claude Code uses OAuth; tokens are session-scoped on tmpfs, lost on restart |
+| Claude exfiltrates GitHub PAT | PAT in root-owned files (mode 600); readable via gh config (accepted risk — scoped, gh api blocked, can't reach non-allowlisted domains) |
+| Claude reads secrets from /proc | No secrets in Claude's environment; PAT only in root-owned files |
+| Claude self-approves via socket | Approval daemon socket mode 0600 (root-only); Claude (UID 1000) cannot connect |
 | Claude uses command chaining to bypass hook | Hook splits compound commands (`;`, `&&`, `\|\|`, `$()`) and evaluates each sub-command independently |
 | Claude exfiltrates via `git push` | `git push` requires approval; PAT scoped to specific repos only |
 | Claude bypasses gh blocks via `gh api` | `gh api` is hard-blocked |
@@ -546,8 +513,7 @@ claudetainer/
 | Claude injects into other tmux panes | `tmux send-keys/capture-pane/pipe-pane` hard-blocked |
 | Claude exfiltrates via gh gist/repo | `gh gist`, `gh repo create`, `gh repo delete`, `gh auth` hard-blocked |
 | Claude accesses cloud metadata | `169.254.0.0/16` explicitly dropped in iptables |
-| Sidecar/daemon/hook killed | Claude lacks capabilities to signal root-owned processes |
-| Sidecar compromised | Sidecar validates request paths (only expected API endpoints); rate-limited; logged |
+| Approval daemon/hook killed | Claude lacks capabilities to signal root-owned processes |
 | iptables modified | Claude lacks `CAP_NET_ADMIN` |
 | CDN IP rotation breaks allowlist | Background cron re-resolves with atomic `iptables-restore` every 30 minutes |
 | Supply chain compromise at build | Version-pinned installs with SHA256 verification; multi-stage Docker build; GHCR scanning |
