@@ -57,10 +57,12 @@ The base image is **read-only**. Claude runs as an unprivileged user with all ca
 
 | Mount | Type | Purpose |
 |-------|------|---------|
-| `/workspace` | tmpfs (1GB) | Project code — clone repos, write code here |
-| `/tmp` | tmpfs (512MB) | Temporary files |
-| `/home/claude/.cache` | tmpfs (1GB) | Build caches (Bun, pip, etc.) |
+| `/workspace` | tmpfs (512MB) | Project code — clone repos, write code here |
+| `/tmp` | tmpfs (128MB) | Temporary files |
+| `/home/claude/.cache` | tmpfs (256MB) | Build caches (Bun, pip, etc.) |
 | `/home/claude/.claude` | tmpfs (64MB) | Claude Code config (settings.json, populated at boot) |
+
+tmpfs is backed by RAM. Total addressable tmpfs is ~960MB, but only consumes RAM for data actually written. On a 1GB machine this leaves headroom for system processes, sidecar, and Claude Code. For larger projects, increase machine RAM to 2GB and scale tmpfs sizes accordingly.
 
 Everything else (system binaries, hook scripts, rules.conf, the `approve` binary) is immutable at runtime. The settings.json copy on the `/home/claude/.claude` tmpfs is root-owned (mode 644) — Claude can read it but not modify it.
 
@@ -69,7 +71,7 @@ Everything else (system binaries, hook scripts, rules.conf, the `approve` binary
 - Claude runs as user `claude` (UID 1000), not root
 - `--cap-drop=ALL` — no Linux capabilities
 - `--security-opt=no-new-privileges` — cannot escalate via setuid/setgid
-- Seccomp profile blocks: `bpf()`, `mount()`, `ptrace()`, `personality()`
+- Seccomp profile: **extends Docker's default** seccomp profile with additional blocks: `bpf()`, `mount()`, `ptrace()`, `personality()`, `unshare()`, `setns()` (prevents user namespace creation and namespace escape)
 
 **What this eliminates:** Self-modification attacks, privilege escalation, eBPF loading, process tracing/injection, filesystem remounting. The PreToolUse hook and rules.conf are guaranteed immutable because they live on the read-only root filesystem.
 
@@ -127,6 +129,10 @@ iptables -A OUTPUT -p udp -j DROP
 
 # Log dropped packets for audit trail (rate-limited)
 iptables -A OUTPUT -j LOG --log-prefix "CLAUDETAINER_DROP: " --log-level 4 -m limit --limit 5/min
+
+# IPv6: drop all outbound (prevent IPv6 bypass of IPv4 rules)
+ip6tables -P OUTPUT DROP
+ip6tables -A OUTPUT -o lo -j ACCEPT
 ```
 
 **Domain allowlist configuration:** The allowlist lives in `/opt/network/domains.conf` (one domain per line) on the read-only filesystem. The entrypoint resolves each domain to all returned IPs (via `dig +short`) and creates iptables rules for each. Where services publish IP ranges (e.g., GitHub's meta API), CIDR blocks are used instead of individual IPs. To add a new domain, update `domains.conf` in the repo and redeploy.
@@ -336,9 +342,10 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
 
 ### Fly Machine Configuration
 
-- **Size:** `shared-cpu-1x`, 512MB RAM
+- **Size:** `shared-cpu-1x`, 1GB RAM (minimum; 2GB recommended for larger projects)
 - **Persistence:** None — workspace is ephemeral, GitHub is source of truth
 - **Restart policy:** `no` (manual restarts only)
+- **Maximum lifetime:** 24 hours. The entrypoint starts a background process (`sleep 86400 && fly machine stop`) that auto-stops the container after 24 hours, limiting the window for stale rules or long-running exfiltration attempts. The user can restart the machine for a new session.
 
 ### Secrets (via `fly secrets set`)
 
