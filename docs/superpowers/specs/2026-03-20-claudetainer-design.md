@@ -60,6 +60,7 @@ The base image is **read-only**. Claude runs as an unprivileged user with all ca
 | `/workspace` | tmpfs (1GB) | Project code — clone repos, write code here |
 | `/tmp` | tmpfs (512MB) | Temporary files |
 | `/home/claude/.cache` | tmpfs (1GB) | Build caches (Bun, pip, etc.) |
+| `/home/claude/.claude` | tmpfs (64MB) | Claude Code config (settings.json, populated at boot) |
 
 Everything else (system binaries, hook scripts, rules.conf, settings.json, the `approve` binary) is immutable at runtime.
 
@@ -119,7 +120,9 @@ iptables -A OUTPUT -d <registry.npmjs.org> -j ACCEPT
 iptables -A OUTPUT -p udp -j DROP
 ```
 
-**Domain allowlist configuration:** The allowlist lives in `/opt/network/domains.conf` (one domain per line) on the read-only filesystem. The entrypoint resolves each domain to IPs and creates iptables rules. To add a new domain, update `domains.conf` in the repo and redeploy.
+**Domain allowlist configuration:** The allowlist lives in `/opt/network/domains.conf` (one domain per line) on the read-only filesystem. The entrypoint resolves each domain to all returned IPs (via `dig +short`) and creates iptables rules for each. Where services publish IP ranges (e.g., GitHub's meta API), CIDR blocks are used instead of individual IPs. To add a new domain, update `domains.conf` in the repo and redeploy.
+
+**IP resolution staleness:** CDNs rotate IPs. For long-running containers, resolved IPs may become stale. Mitigations: (a) resolve all IPs returned by DNS, not just the first; (b) use CIDR blocks where available; (c) containers are expected to be short-lived (hours to days, not weeks); (d) a periodic background job (cron, every 30 minutes) re-resolves domains and updates iptables rules. This job runs as root and is not accessible to the `claude` user.
 
 **DNS control:** All DNS queries go to a single trusted resolver. Queries for non-allowlisted domains still resolve (needed for the hook to show meaningful error messages), but the iptables rules prevent actual connections to non-allowlisted IPs.
 
@@ -190,19 +193,20 @@ Both `block:` and `approve:` use exit code 2 (blocked). The difference is the st
 
 **Approval flow:**
 
-The `approve` CLI tool (`/usr/local/bin/approve`) enables one-shot command approval:
+The `approve` CLI tool (`/usr/local/bin/approve`) communicates with a small root-owned **approval daemon** (`/opt/approval/approval-daemon`) that manages tokens. The daemon listens on a Unix domain socket (`/run/claude-approval.sock`) owned by root, writable by the `claude` user (mode 0622). The token directory (`/run/claude-approved/`) is owned by root and writable only by root — Claude cannot forge tokens by writing files directly.
 
 1. Claude runs `bun add react`
 2. Hook matches `approve:^bun\s+(add|install)\b` → exits 2 with instructions
 3. User types `! approve 'bun add react'` in Claude Code prompt
-4. `approve` script computes SHA256 hash of the literal command string and writes it to `/tmp/claude-approved/<hash>`
-5. Claude retries `bun add react`
-6. Hook finds the matching token → deletes it → exits 0
-7. Command executes (network request succeeds because `registry.npmjs.org` is in the iptables allowlist)
+4. `approve` CLI sends the command string to the approval daemon via the Unix socket
+5. Daemon computes SHA256 hash and writes token to `/run/claude-approved/<hash>` (root-owned directory)
+6. Claude retries `bun add react`
+7. Hook computes the same hash, finds the matching token → deletes it → exits 0
+8. Command executes (network request succeeds because `registry.npmjs.org` is in the iptables allowlist)
 
 Approvals are **one-shot**: each token is consumed on use. Approving `bun add react` does not approve `bun add malicious-package`. Tokens are cleared on container restart.
 
-**Self-approval prevention:** `block:^approve\b` prevents Claude from running the `approve` command via the Bash tool.
+**Self-approval prevention:** `block:^approve\b` prevents Claude from running the `approve` command via the Bash tool. Even if Claude bypassed this, writing directly to the token directory fails because it is root-owned (mode 0700). The Unix socket only accepts writes from the `approve` CLI, which Claude cannot execute through the hook.
 
 **Why this works with Layer 2:** The iptables allowlist permits traffic to package registries, but the hook gates which install commands actually run. Claude can't bypass the hook to run `bun add evil-package` because the hook fires on every Bash tool invocation even in `--dangerously-skip-permissions` mode. The two layers complement: iptables blocks unknown domains, the hook blocks unapproved commands to known domains.
 
@@ -217,7 +221,8 @@ The sidecar runs as root (separate from Claude's process), listens on `127.0.0.1
 Claude's environment sees:
 - `ANTHROPIC_API_BASE_URL=http://127.0.0.1:4111` — points to the sidecar, not the real API
 - No `ANTHROPIC_API_KEY` in the environment
-- `GH_PAT` is not in Claude's environment — the git credential helper is configured by root in the entrypoint (credential stored in `/root/.git-credentials`, unreadable by the `claude` user)
+- No `GH_PAT` in the environment — git credential helper configured by root (stored in `/root/.git-credentials`, unreadable by `claude`)
+- GitHub MCP server URL points to `http://127.0.0.1:4112/mcp/` — sidecar injects the PAT
 
 **Git credential isolation:**
 
@@ -231,7 +236,9 @@ The `claude` user can run `git clone/push/pull` and git transparently authentica
 
 **MCP server authentication:**
 
-The GitHub MCP server header (`Authorization: Bearer <token>`) is populated by the entrypoint via `sed`/`envsubst` into settings.json, which lives on the read-only filesystem. Claude can read settings.json to see the token value — this is a known limitation. The sidecar protects the Anthropic key (higher value); the GitHub PAT is lower risk since its permissions are scoped to the robot account.
+The GitHub MCP server is also routed through the sidecar. The sidecar exposes a second endpoint (`127.0.0.1:4112`) that proxies to `api.githubcopilot.com` and injects the `Authorization: Bearer <GH_PAT>` header. Claude's settings.json points the GitHub MCP server URL to `http://127.0.0.1:4112/mcp/` — Claude never sees the PAT value.
+
+The `GH_PAT` is scoped to the robot GitHub account with minimum necessary permissions (repo read/write for specific repos, no admin access). Even so, by routing through the sidecar, the PAT cannot be exfiltrated from Claude's environment.
 
 **What this eliminates:** API key exfiltration. Even if Claude is fully compromised, the Anthropic API key cannot be extracted — it exists only in the sidecar's process memory and the Fly secret store.
 
@@ -252,11 +259,12 @@ The GitHub MCP server header (`Authorization: Bearer <token>`) is populated by t
 
 ### Claude Code Configuration
 
-`claude-settings.json` baked into the image at `/home/claude/.claude/settings.json`:
+`claude-settings.json` is baked into the image at `/opt/claude/settings.json` as a template. At boot, the entrypoint copies it to `/home/claude/.claude/settings.json` (which lives on a small tmpfs mount for `/home/claude/.claude`), so no secrets are baked into the image and the read-only filesystem is not violated.
 
+Contents:
 - **PreToolUse hook** pointing to `/opt/approval/check-command.sh`
 - **MCP servers:**
-  - GitHub: `https://api.githubcopilot.com/mcp/` with `Authorization: Bearer <GH_PAT>` (substituted at boot)
+  - GitHub: `http://127.0.0.1:4112/mcp/` (proxied through sidecar, no credentials in config)
   - Bun docs: `https://bun.com/docs/mcp`
 
 ### Superpowers Plugin
@@ -292,22 +300,24 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
 `/usr/local/bin/entrypoint.sh` runs as root and performs:
 
 1. **Network lockdown:**
-   - Read `/opt/network/domains.conf`, resolve each domain to IPs
+   - Read `/opt/network/domains.conf`, resolve each domain to all IPs via `dig +short`
    - Apply iptables rules: `OUTPUT DROP` default, explicit ACCEPT for resolved IPs
    - Block all UDP except DNS to trusted resolver
+   - Start background cron job to re-resolve domains every 30 minutes
 2. **Git configuration:**
    - Write `$GH_PAT` to `/root/.git-credentials` (root-owned, mode 600)
    - Configure git system-wide credential helper pointing to that file
    - Set git identity from `$GIT_AUTHOR_NAME` / `$GIT_AUTHOR_EMAIL` env vars
 3. **Sidecar startup:**
-   - Start the auth sidecar proxy on `127.0.0.1:4111`
-   - Sidecar reads `$ANTHROPIC_API_KEY` from environment, proxies to `api.anthropic.com`
+   - Start the auth sidecar proxy:
+     - `127.0.0.1:4111` → proxies to `api.anthropic.com` (injects `ANTHROPIC_API_KEY`)
+     - `127.0.0.1:4112` → proxies to `api.githubcopilot.com` (injects `GH_PAT`)
+   - Start the approval daemon on Unix socket `/run/claude-approval.sock`
 4. **Claude Code setup:**
-   - Substitute `<GH_PAT>` in settings.json via `sed`
+   - Copy settings template from `/opt/claude/settings.json` to `/home/claude/.claude/settings.json` (tmpfs)
    - Export `GH_TOKEN=$GH_PAT` for gh CLI
    - Install superpowers plugin (log warning on failure)
 5. **Session startup:**
-   - Create `/tmp/claude-approved/` (writable by `claude` user — needed for approval tokens)
    - Start tmux session as `claude` user with `remain-on-exit on`
    - In tmux: `cd /workspace && claude --dangerously-skip-permissions`
    - `exec tmux attach -t claude` (keeps container alive)
@@ -358,15 +368,17 @@ claudetainer/
 │       └── deploy.yml
 ├── entrypoint.sh
 ├── sidecar/
-│   └── auth-proxy            # Lightweight reverse proxy for API key injection
+│   └── auth-proxy            # Reverse proxy: injects API keys into requests
 ├── approval/
 │   ├── check-command.sh       # PreToolUse hook script
 │   ├── rules.conf             # Configurable allow/approve/block patterns
-│   └── approve                # CLI tool for one-shot command approval
+│   ├── approve                # CLI tool: sends approval requests to daemon
+│   └── approval-daemon        # Root-owned daemon: manages approval tokens
 ├── network/
-│   └── domains.conf           # Domain allowlist (one per line)
+│   ├── domains.conf           # Domain allowlist (one per line)
+│   └── refresh-iptables.sh    # Cron script: re-resolves domains, updates rules
 ├── seccomp-profile.json       # Seccomp policy (blocks bpf, mount, ptrace, etc.)
-└── claude-settings.json       # Claude Code settings: hook config + MCP servers
+└── claude-settings.json       # Claude Code settings template (no secrets)
 ```
 
 | File | Purpose |
@@ -374,14 +386,16 @@ claudetainer/
 | `Dockerfile` | Image build: Bun, Python, CLI tools, Claude Code, non-root user, read-only FS |
 | `fly.toml` | Fly app config: app name, region, machine size |
 | `deploy.yml` | GitHub Action: build → push to GHCR → deploy to Fly |
-| `entrypoint.sh` | Container startup: iptables, git config, sidecar, plugin install, tmux |
-| `auth-proxy` | Sidecar: injects ANTHROPIC_API_KEY into proxied requests |
+| `entrypoint.sh` | Container startup: iptables, git config, sidecar, approval daemon, tmux |
+| `auth-proxy` | Sidecar: proxies Anthropic API (:4111) and GitHub MCP (:4112), injects keys |
 | `check-command.sh` | PreToolUse hook: reads rules.conf, enforces command tiers |
 | `rules.conf` | Configurable allow/approve/block regex patterns for Bash commands |
-| `approve` | CLI tool: writes one-shot approval tokens (SHA256 hash) |
+| `approve` | CLI tool: sends approval hash to daemon via Unix socket |
+| `approval-daemon` | Root-owned: listens on Unix socket, writes tokens to root-owned directory |
 | `domains.conf` | Network allowlist: domains whose IPs are permitted through iptables |
+| `refresh-iptables.sh` | Cron job (every 30m): re-resolves domains, updates iptables rules |
 | `seccomp-profile.json` | Kernel syscall restrictions (blocks bpf, mount, ptrace, etc.) |
-| `claude-settings.json` | Claude Code settings: hook config + MCP servers |
+| `claude-settings.json` | Claude Code settings template: hook config + MCP servers (no secrets) |
 
 ## Security Properties Summary
 
@@ -392,10 +406,13 @@ claudetainer/
 | Claude loads eBPF/kernel modules | Seccomp blocks `bpf()`, `mount()` |
 | Claude connects to unknown domains | iptables `OUTPUT DROP` default, explicit allowlist |
 | Claude exfiltrates via DNS | DNS restricted to trusted resolver, UDP blocked except DNS |
-| Claude exfiltrates API keys | Sidecar holds keys, never in Claude's environment |
+| Claude exfiltrates API keys | Sidecar holds keys, never in Claude's environment or config files |
+| Claude exfiltrates GitHub PAT | PAT not in environment or settings.json; MCP routed through sidecar |
 | Claude runs `sudo`, `rm -rf /` | Hook hard-blocks destructive commands |
 | Claude installs malicious package | Hook requires per-command approval for all install commands |
-| Claude self-approves commands | `approve` command is in the hook's hard-block tier |
+| Claude self-approves commands | `approve` blocked by hook; token directory root-owned (mode 0700) |
+| Claude forges approval tokens | Token directory writable only by root-owned approval daemon |
 | Claude bypasses via QUIC/UDP | All UDP dropped except DNS |
-| Proxy/hook process killed | Claude lacks capabilities to signal root-owned processes |
+| Sidecar/daemon/hook killed | Claude lacks capabilities to signal root-owned processes |
 | iptables modified | Claude lacks `CAP_NET_ADMIN` |
+| CDN IP rotation breaks allowlist | Background cron re-resolves domains every 30 minutes |
