@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a Docker-based interactive Claude Code development environment deployed to Fly.io with a four-layer security model (container hardening, network boundary, command approval hook, credential-isolating sidecar).
+**Goal:** Build a Docker-based interactive Claude Code environment deployed to Fly.io with three security layers: container hardening (read-only FS, non-root, seccomp), network boundary (iptables + CoreDNS), and command approval hook.
 
-**Architecture:** Four independent security layers compose into a defense-in-depth sandbox. A read-only root filesystem makes all enforcement tamper-proof. iptables + CoreDNS enforce network boundaries. A PreToolUse hook gates commands. A Go reverse proxy sidecar isolates API credentials. All orchestrated by an entrypoint script that configures security before dropping to an unprivileged user.
+**Architecture:** Read-only root filesystem makes enforcement tamper-proof. iptables + CoreDNS enforce network boundaries at both IP and DNS levels. A PreToolUse hook gates commands via configurable regex patterns with a one-shot approval flow. Claude Code authenticates via interactive OAuth. GitHub PAT stored in root-owned files. No sidecar, no Go code — just bash scripts and standard Linux primitives.
 
-**Tech Stack:** Docker (debian:bookworm-slim), Go (sidecar proxy), Bash (entrypoint, hook, approval tools), CoreDNS, iptables/ip6tables, jq, tmux, GitHub Actions, Fly.io
+**Tech Stack:** Docker (debian:bookworm-slim), Bash (entrypoint, hook, approval tools), CoreDNS, iptables/ip6tables, socat, jq, tmux, GitHub Actions, Fly.io
 
 **Spec:** `docs/superpowers/specs/2026-03-20-claudetainer-design.md`
 
@@ -16,45 +16,38 @@
 
 ```
 claudetainer/
-├── Dockerfile                          # Multi-stage build: builder → final image
-├── fly.toml                            # Fly app config (no services/ports exposed)
-├── .github/
-│   └── workflows/
-│       └── deploy.yml                  # CI: build → push GHCR → deploy Fly
-├── entrypoint.sh                       # Root startup: network, git, sidecar, tmux
-├── sidecar/
-│   ├── main.go                         # Auth proxy: Anthropic (:4111) + GitHub (:4112)
-│   ├── go.mod                          # Go module definition
-│   └── go.sum                          # Go dependency checksums
+├── Dockerfile
+├── fly.toml
+├── .github/workflows/build.yml
+├── entrypoint.sh
 ├── approval/
-│   ├── check-command.sh                # PreToolUse hook: reads rules.conf, splits compounds
-│   ├── rules.conf                      # Allow/block/approve regex patterns
-│   ├── approve                         # Bash CLI: sends hash to daemon via Unix socket
-│   └── approval-daemon                 # Bash daemon: listens on socket, writes tokens
+│   ├── check-command.sh
+│   ├── handle-approval.sh
+│   ├── rules.conf
+│   ├── approve
+│   └── approval-daemon
 ├── network/
-│   ├── domains.conf                    # Domain allowlist (one per line)
-│   ├── Corefile                        # CoreDNS config: forward allowlisted, NXDOMAIN rest
-│   └── refresh-iptables.sh             # Cron: re-resolve domains, atomic iptables-restore
-├── status                              # Bash CLI: show approvals, blocks, sidecar health
-├── seccomp-profile.json                # Extends Docker default + blocks bpf/mount/ptrace/unshare/setns
-└── claude-settings.json                # Template: hook config + MCP servers (no secrets)
+│   ├── domains.conf
+│   ├── Corefile.template
+│   └── refresh-iptables.sh
+├── status
+├── seccomp-profile.json
+└── claude-settings.json
 ```
 
 ---
 
-### Task 1: Project Scaffolding & Domain Allowlist
+### Task 1: Network Configuration Files
 
 **Files:**
 - Create: `network/domains.conf`
-- Create: `network/Corefile`
-- Create: `seccomp-profile.json`
-- Create: `claude-settings.json`
-- Create: `approval/rules.conf`
+- Create: `network/Corefile.template`
+- Create: `network/refresh-iptables.sh`
 
 - [ ] **Step 1: Create `network/domains.conf`**
 
 ```
-# Infrastructure (Claude Code)
+# Infrastructure (Claude Code OAuth + API)
 api.anthropic.com
 statsig.anthropic.com
 console.anthropic.com
@@ -79,11 +72,13 @@ bun.com
 npm.pkg.github.com
 ```
 
-- [ ] **Step 2: Create `network/Corefile`**
+- [ ] **Step 2: Create `network/Corefile.template`**
 
-CoreDNS config that reads `domains.conf` and only forwards queries for listed domains.
+This is the base CoreDNS config. The entrypoint appends per-domain forward blocks from `domains.conf`.
 
 ```
+# Default: return NXDOMAIN for all queries
+# Per-domain forward blocks are appended by the entrypoint
 . {
     log
     errors
@@ -94,220 +89,80 @@ CoreDNS config that reads `domains.conf` and only forwards queries for listed do
         rcode NXDOMAIN
     }
 }
-
-# Each allowlisted domain gets a forward block.
-# The entrypoint generates this file dynamically from domains.conf
-# by appending a forward block per domain. This template is the base.
 ```
 
-Note: The actual Corefile will be generated by the entrypoint from `domains.conf`. The template above is the fallback (NXDOMAIN everything). The entrypoint appends blocks like:
-
-```
-api.anthropic.com {
-    forward . 8.8.8.8 1.1.1.1
-}
-```
-
-for each domain in `domains.conf`. Store the template as `network/Corefile.template`.
-
-- [ ] **Step 3: Rename to `network/Corefile.template` and create generation logic**
-
-Update the file to be a template. The entrypoint will generate the final Corefile.
-
-- [ ] **Step 4: Create `seccomp-profile.json`**
-
-Start from Docker's default seccomp profile and add blocks for `bpf`, `mount`, `ptrace`, `personality`, `unshare`, `setns`.
-
-```json
-{
-  "defaultAction": "SCMP_ACT_ERRNO",
-  "defaultErrnoRet": 1,
-  "comment": "Extends Docker default seccomp profile with additional blocks",
-  "syscalls": [
-    {
-      "names": [
-        "accept", "accept4", "access", "adjtimex", "alarm", "bind",
-        "brk", "capget", "capset", "chdir", "chmod", "chown", "chown32",
-        "clock_adjtime", "clock_adjtime64", "clock_getres", "clock_getres_time64",
-        "clock_gettime", "clock_gettime64", "clock_nanosleep", "clock_nanosleep_time64",
-        "clone", "clone3", "close", "close_range", "connect", "copy_file_range",
-        "creat", "dup", "dup2", "dup3", "epoll_create", "epoll_create1",
-        "epoll_ctl", "epoll_ctl_old", "epoll_pwait", "epoll_pwait2",
-        "epoll_wait", "epoll_wait_old", "eventfd", "eventfd2", "execve",
-        "execveat", "exit", "exit_group", "faccessat", "faccessat2",
-        "fadvise64", "fadvise64_64", "fallocate", "fanotify_mark",
-        "fchdir", "fchmod", "fchmodat", "fchmodat2", "fchown", "fchown32",
-        "fchownat", "fcntl", "fcntl64", "fdatasync", "fgetxattr",
-        "flistxattr", "flock", "fork", "fremovexattr", "fsetxattr",
-        "fstat", "fstat64", "fstatat64", "fstatfs", "fstatfs64",
-        "fsync", "ftruncate", "ftruncate64", "futex", "futex_time64",
-        "futex_waitv", "futimesat", "get_robust_list", "get_thread_area",
-        "getcpu", "getcwd", "getdents", "getdents64", "getegid",
-        "getegid32", "geteuid", "geteuid32", "getgid", "getgid32",
-        "getgroups", "getgroups32", "getitimer", "getpeername", "getpgid",
-        "getpgrp", "getpid", "getppid", "getpriority", "getrandom",
-        "getresgid", "getresgid32", "getresuid", "getresuid32",
-        "getrlimit", "getrusage", "getsid", "getsockname", "getsockopt",
-        "gettid", "gettimeofday", "getuid", "getuid32", "getxattr",
-        "inotify_add_watch", "inotify_init", "inotify_init1",
-        "inotify_rm_watch", "io_cancel", "io_destroy", "io_getevents",
-        "io_pgetevents", "io_pgetevents_time64", "io_setup", "io_submit",
-        "io_uring_enter", "io_uring_register", "io_uring_setup",
-        "ioctl", "ioprio_get", "ioprio_set", "ipc", "kill", "landlock_add_rule",
-        "landlock_create_ruleset", "landlock_restrict_self", "lchown",
-        "lchown32", "lgetxattr", "link", "linkat", "listen",
-        "listxattr", "llistxattr", "lremovexattr", "lseek", "lsetxattr",
-        "lstat", "lstat64", "madvise", "membarrier", "memfd_create",
-        "memfd_secret", "mincore", "mkdir", "mkdirat", "mknod",
-        "mknodat", "mlock", "mlock2", "mlockall", "mmap", "mmap2",
-        "mprotect", "mq_getsetattr", "mq_notify", "mq_open",
-        "mq_timedreceive", "mq_timedreceive_time64", "mq_timedsend",
-        "mq_timedsend_time64", "mq_unlink", "mremap", "msgctl",
-        "msgget", "msgrcv", "msgsnd", "msync", "munlock", "munlockall",
-        "munmap", "name_to_handle_at", "nanosleep", "newfstatat",
-        "open", "openat", "openat2", "pause", "pidfd_open",
-        "pidfd_send_signal", "pipe", "pipe2", "poll", "ppoll",
-        "ppoll_time64", "prctl", "pread64", "preadv", "preadv2",
-        "prlimit64", "process_mrelease", "pselect6", "pselect6_time64",
-        "pwrite64", "pwritev", "pwritev2", "read", "readahead",
-        "readlink", "readlinkat", "readv", "recv", "recvfrom",
-        "recvmmsg", "recvmmsg_time64", "recvmsg", "remap_file_pages",
-        "removexattr", "rename", "renameat", "renameat2",
-        "restart_syscall", "rmdir", "rseq", "rt_sigaction",
-        "rt_sigpending", "rt_sigprocmask", "rt_sigqueueinfo",
-        "rt_sigreturn", "rt_sigsuspend", "rt_sigtimedwait",
-        "rt_sigtimedwait_time64", "rt_tgsigqueueinfo", "sched_get_priority_max",
-        "sched_get_priority_min", "sched_getaffinity", "sched_getattr",
-        "sched_getparam", "sched_getscheduler", "sched_rr_get_interval",
-        "sched_rr_get_interval_time64", "sched_setaffinity",
-        "sched_setattr", "sched_setparam", "sched_setscheduler",
-        "sched_yield", "seccomp", "select", "semctl", "semget",
-        "semop", "semtimedop", "semtimedop_time64", "send", "sendfile",
-        "sendfile64", "sendmmsg", "sendmsg", "sendto", "set_robust_list",
-        "set_thread_area", "set_tid_address", "setfsgid", "setfsgid32",
-        "setfsuid", "setfsuid32", "setgid", "setgid32", "setgroups",
-        "setgroups32", "setitimer", "setpgid", "setpriority",
-        "setregid", "setregid32", "setresgid", "setresgid32",
-        "setresuid", "setresuid32", "setreuid", "setreuid32",
-        "setrlimit", "setsid", "setsockopt", "setuid", "setuid32",
-        "setxattr", "shmat", "shmctl", "shmdt", "shmget", "shutdown",
-        "sigaltstack", "signalfd", "signalfd4", "sigprocmask",
-        "sigreturn", "socket", "socketcall", "socketpair", "splice",
-        "stat", "stat64", "statfs", "statfs64", "statx", "symlink",
-        "symlinkat", "sync", "sync_file_range", "syncfs", "sysinfo",
-        "tee", "tgkill", "time", "timer_create", "timer_delete",
-        "timer_getoverrun", "timer_gettime", "timer_gettime64",
-        "timer_settime", "timer_settime64", "timerfd_create",
-        "timerfd_gettime", "timerfd_gettime64", "timerfd_settime",
-        "timerfd_settime64", "times", "tkill", "truncate",
-        "truncate64", "ugetrlimit", "umask", "uname", "unlink",
-        "unlinkat", "utime", "utimensat", "utimensat_time64",
-        "utimes", "vfork", "vmsplice", "wait4", "waitid", "waitpid",
-        "write", "writev"
-      ],
-      "action": "SCMP_ACT_ALLOW"
-    },
-    {
-      "names": ["bpf"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block eBPF program loading"
-    },
-    {
-      "names": ["mount", "umount", "umount2"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block filesystem mounting"
-    },
-    {
-      "names": ["ptrace"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block process tracing"
-    },
-    {
-      "names": ["personality"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block execution domain changes"
-    },
-    {
-      "names": ["unshare"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block namespace creation"
-    },
-    {
-      "names": ["setns"],
-      "action": "SCMP_ACT_ERRNO",
-      "errnoRet": 1,
-      "comment": "Block namespace switching"
-    }
-  ]
-}
-```
-
-- [ ] **Step 5: Create `claude-settings.json`**
-
-This is a template — `__SIDECAR_TOKEN__` is substituted by the entrypoint at boot.
-
-```json
-{
-  "env": {
-    "ANTHROPIC_API_BASE_URL": "http://127.0.0.1:4111"
-  },
-  "permissions": {},
-  "mcpServers": {
-    "github": {
-      "type": "http",
-      "url": "http://127.0.0.1:4112/mcp/",
-      "headers": {
-        "X-Claudetainer-Token": "__SIDECAR_TOKEN__"
-      }
-    },
-    "bun-docs": {
-      "type": "http",
-      "url": "https://bun.com/docs/mcp"
-    }
-  },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "/opt/approval/check-command.sh",
-            "timeout": 300
-          }
-        ]
-      }
-    ]
-  }
-}
-```
-
-- [ ] **Step 6: Create `approval/rules.conf`**
-
-Copy the rules.conf verbatim from the spec (lines 172-227).
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 3: Create `network/refresh-iptables.sh`**
 
 ```bash
-git add network/ seccomp-profile.json claude-settings.json approval/rules.conf
-git commit -m "feat: add config files — domains, CoreDNS template, seccomp, settings, rules"
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAINS_FILE="/opt/network/domains.conf"
+RULES_FILE=$(mktemp)
+
+cat > "$RULES_FILE" <<'HEADER'
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT DROP [0:0]
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -d 169.254.0.0/16 -j DROP
+-A OUTPUT -d 172.16.0.0/12 -j DROP
+-A OUTPUT -p udp -d 127.0.0.53 --dport 53 -j ACCEPT
+-A OUTPUT -p tcp -d 127.0.0.53 --dport 53 -j ACCEPT
+-A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+HEADER
+
+while IFS= read -r domain || [[ -n "$domain" ]]; do
+  [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "$domain" ]] && continue
+  domain=$(echo "$domain" | tr -d '[:space:]')
+
+  ips=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+  for ip in $ips; do
+    echo "-A OUTPUT -d $ip -j ACCEPT" >> "$RULES_FILE"
+  done
+done < "$DOMAINS_FILE"
+
+echo "-A OUTPUT -p udp -j DROP" >> "$RULES_FILE"
+echo '-A OUTPUT -j LOG --log-prefix "CLAUDETAINER_DROP: " --log-level 4 -m limit --limit 5/min' >> "$RULES_FILE"
+echo "COMMIT" >> "$RULES_FILE"
+
+iptables-restore < "$RULES_FILE"
+
+ip6tables -P OUTPUT DROP 2>/dev/null || true
+ip6tables -F OUTPUT 2>/dev/null || true
+ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+ip6tables -A OUTPUT -d fdaa::/16 -j DROP 2>/dev/null || true
+
+rm -f "$RULES_FILE"
+echo "[NETWORK] iptables refreshed at $(date)" >&2
+```
+
+- [ ] **Step 4: Make executable and commit**
+
+```bash
+chmod +x network/refresh-iptables.sh
+git add network/
+git commit -m "feat: add network config — domains, CoreDNS template, iptables refresh"
 ```
 
 ---
 
-### Task 2: PreToolUse Hook (`check-command.sh`)
+### Task 2: Approval System
 
 **Files:**
+- Create: `approval/rules.conf`
 - Create: `approval/check-command.sh`
+- Create: `approval/approval-daemon`
+- Create: `approval/handle-approval.sh`
+- Create: `approval/approve`
 
-- [ ] **Step 1: Write the hook script**
+- [ ] **Step 1: Create `approval/rules.conf`**
 
-The hook reads JSON from stdin, extracts `tool_name`. For non-Bash tools, exits 0. For Bash tools, extracts the command, splits on chaining operators, and evaluates each sub-command against `rules.conf` patterns (first match wins). Exits 0 (allow), or 2 (block/approve-required with appropriate message on stderr).
+Copy the rules verbatim from spec lines 176-233.
+
+- [ ] **Step 2: Create `approval/check-command.sh`**
 
 ```bash
 #!/usr/bin/env bash
@@ -316,49 +171,34 @@ set -euo pipefail
 RULES_FILE="/opt/approval/rules.conf"
 APPROVED_DIR="/run/claude-approved"
 
-# Read JSON from stdin
 INPUT=$(cat)
-
-# Extract tool name
 TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // ""')
 
-# Auto-approve non-Bash tools
 if [[ "$TOOL_NAME" != "Bash" ]]; then
   exit 0
 fi
 
-# Extract command
 COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // ""')
-if [[ -z "$COMMAND" ]]; then
-  exit 0
-fi
+[[ -z "$COMMAND" ]] && exit 0
 
-# Log the command being evaluated
 echo "[HOOK] Evaluating: $COMMAND" >&2
 
-# Function to evaluate a single command against rules
 evaluate_command() {
   local cmd="$1"
-  # Trim leading whitespace
   cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
+  [[ -z "$cmd" ]] && return 0
 
-  if [[ -z "$cmd" ]]; then
-    return 0
-  fi
-
-  # Check for an existing approval token
   local hash
   hash=$(echo -n "$cmd" | sha256sum | cut -d' ' -f1)
   if [[ -f "$APPROVED_DIR/$hash" ]]; then
-    rm -f "$APPROVED_DIR/$hash"
-    echo "[HOOK] APPROVED (token consumed): $cmd" >&2
+    rm -f "$APPROVED_DIR/$hash" 2>/dev/null || true
+    echo "[HOOK] APPROVED (token): $cmd" >&2
     return 0
   fi
 
   local default_action="block"
 
   while IFS= read -r line || [[ -n "$line" ]]; do
-    # Skip comments and blank lines
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     [[ -z "$line" ]] && continue
 
@@ -392,7 +232,6 @@ evaluate_command() {
     esac
   done < "$RULES_FILE"
 
-  # Default action
   if [[ "$default_action" == "allow" ]]; then
     echo "[HOOK] DEFAULT ALLOW: $cmd" >&2
     return 0
@@ -403,37 +242,32 @@ evaluate_command() {
   fi
 }
 
-# Split compound commands on chaining operators and evaluate each
-# We use a simple approach: split on ;, &&, ||
-# Also check for $(...) and backticks inline
 split_and_evaluate() {
   local full_cmd="$1"
 
-  # Check for subshell/command substitution patterns
-  # If found, evaluate the outer command AND the inner commands
-  if echo "$full_cmd" | grep -qE '\$\(|`'; then
-    # Extract inner commands from $(...) and backtick
-    # For security, evaluate the full string as-is too
-    # This is conservative: if any part fails, block the whole thing
-    local inner
-    inner=$(echo "$full_cmd" | grep -oE '\$\([^)]+\)' | sed 's/\$(\(.*\))/\1/' || true)
-    if [[ -n "$inner" ]]; then
-      evaluate_command "$inner" || return $?
-    fi
-    inner=$(echo "$full_cmd" | grep -oE '`[^`]+`' | sed 's/`\(.*\)`/\1/' || true)
-    if [[ -n "$inner" ]]; then
-      evaluate_command "$inner" || return $?
-    fi
+  # Check for $() and backtick subshells — extract and evaluate inner commands
+  local inner
+  inner=$(echo "$full_cmd" | grep -oP '\$\(\K[^)]+' || true)
+  if [[ -n "$inner" ]]; then
+    while IFS= read -r subcmd; do
+      evaluate_command "$subcmd" || return $?
+    done <<< "$inner"
+  fi
+  inner=$(echo "$full_cmd" | grep -oP '`\K[^`]+' || true)
+  if [[ -n "$inner" ]]; then
+    while IFS= read -r subcmd; do
+      evaluate_command "$subcmd" || return $?
+    done <<< "$inner"
   fi
 
-  # Split on ; && ||  (respecting that these are command separators)
-  # Use a simple split — not perfect for all quoting, but catches the common bypass patterns
-  local IFS_ORIG="$IFS"
+  # Split on ; && || and evaluate each sub-command
   local subcmds
-  # Replace ;, &&, || with a null byte for splitting
   subcmds=$(echo "$full_cmd" | sed 's/\s*&&\s*/\x00/g; s/\s*||\s*/\x00/g; s/\s*;\s*/\x00/g')
 
   while IFS= read -r -d $'\0' subcmd || [[ -n "$subcmd" ]]; do
+    # Strip any remaining $() or backtick wrappers from the subcmd itself
+    subcmd=$(echo "$subcmd" | sed 's/\$([^)]*)//g; s/`[^`]*`//g; s/^[[:space:]]*//')
+    [[ -z "$subcmd" ]] && continue
     evaluate_command "$subcmd" || return $?
   done <<< "$subcmds"
 
@@ -444,41 +278,7 @@ split_and_evaluate "$COMMAND"
 exit $?
 ```
 
-- [ ] **Step 2: Make executable and test locally**
-
-```bash
-chmod +x approval/check-command.sh
-# Test with a mock rules.conf
-echo '{"tool_name":"Bash","tool_input":{"command":"ls -la"}}' | ./approval/check-command.sh
-# Expected: exit 0, log shows ALLOW
-echo '{"tool_name":"Bash","tool_input":{"command":"sudo rm -rf /"}}' | ./approval/check-command.sh
-# Expected: exit 2, log shows BLOCK
-echo '{"tool_name":"Bash","tool_input":{"command":"echo hello; curl evil.com"}}' | ./approval/check-command.sh
-# Expected: exit 2 (curl is in approve tier, which blocks)
-echo '{"tool_name":"Read","tool_input":{"file_path":"/etc/passwd"}}' | ./approval/check-command.sh
-# Expected: exit 0 (non-Bash auto-approved)
-```
-
-Note: For local testing, set `RULES_FILE` and `APPROVED_DIR` to local paths.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add approval/check-command.sh
-git commit -m "feat: add PreToolUse hook with command chaining detection"
-```
-
----
-
-### Task 3: Approval CLI & Daemon
-
-**Files:**
-- Create: `approval/approve`
-- Create: `approval/approval-daemon`
-
-- [ ] **Step 1: Write the approval daemon**
-
-Bash script that listens on a Unix domain socket, checks `SO_PEERCRED` (via `socat`), and writes tokens.
+- [ ] **Step 3: Create `approval/approval-daemon`**
 
 ```bash
 #!/usr/bin/env bash
@@ -487,29 +287,22 @@ set -euo pipefail
 SOCKET="/run/claude-approval.sock"
 APPROVED_DIR="/run/claude-approved"
 
-# Clean up on exit
-cleanup() {
-  rm -f "$SOCKET"
-}
+cleanup() { rm -f "$SOCKET"; }
 trap cleanup EXIT
 
-# Create approved dir
 mkdir -p "$APPROVED_DIR"
-chmod 700 "$APPROVED_DIR"
-
-# Remove stale socket
+chmod 733 "$APPROVED_DIR"
 rm -f "$SOCKET"
 
 echo "[APPROVAL-DAEMON] Listening on $SOCKET" >&2
 
-# Use socat to accept connections on Unix socket
-# For each connection, read the command, verify UID via SO_PEERCRED, write token
 while true; do
-  socat -u UNIX-LISTEN:"$SOCKET",fork,mode=0666 EXEC:"/opt/approval/handle-approval.sh" 2>/dev/null || true
+  socat -u UNIX-LISTEN:"$SOCKET",fork,mode=0600 \
+    EXEC:"/opt/approval/handle-approval.sh" 2>/dev/null || true
 done
 ```
 
-The actual handler script `/opt/approval/handle-approval.sh`:
+- [ ] **Step 4: Create `approval/handle-approval.sh`**
 
 ```bash
 #!/usr/bin/env bash
@@ -517,15 +310,7 @@ set -euo pipefail
 
 APPROVED_DIR="/run/claude-approved"
 
-# Read command from stdin (sent by approve CLI)
 read -r CMD
-
-# socat provides peer credentials via environment when using fork
-# We check via /proc — the socat EXEC handler has $SOCAT_PEERADDR etc.
-# For simplicity in this design, we rely on the socket being only
-# writable by root (the approve CLI runs as root via fly ssh).
-# The approve CLI itself validates it's running as root before connecting.
-
 if [[ -z "$CMD" ]]; then
   echo "ERROR: empty command" >&2
   exit 1
@@ -533,12 +318,12 @@ fi
 
 HASH=$(echo -n "$CMD" | sha256sum | cut -d' ' -f1)
 echo "$CMD" > "$APPROVED_DIR/$HASH"
-chmod 600 "$APPROVED_DIR/$HASH"
+chmod 666 "$APPROVED_DIR/$HASH"
 echo "[APPROVAL-DAEMON] Token written for: $CMD (hash: ${HASH:0:12}...)" >&2
 echo "OK"
 ```
 
-- [ ] **Step 2: Write the approve CLI**
+- [ ] **Step 5: Create `approval/approve`**
 
 ```bash
 #!/usr/bin/env bash
@@ -546,7 +331,6 @@ set -euo pipefail
 
 SOCKET="/run/claude-approval.sock"
 
-# Verify running as root (SO_PEERCRED check on daemon side)
 if [[ "$(id -u)" != "0" ]]; then
   echo "⛔ approve must be run as root (use ! approve from Claude Code)" >&2
   exit 1
@@ -569,231 +353,74 @@ else
 fi
 ```
 
-- [ ] **Step 3: Make both executable, test locally**
+- [ ] **Step 6: Make all executable and commit**
 
 ```bash
-chmod +x approval/approve approval/approval-daemon approval/handle-approval.sh
-```
-
-Note: Full integration testing requires `socat` and running as root. Unit test the hash generation logic.
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add approval/approve approval/approval-daemon
-git commit -m "feat: add approval daemon and CLI with SO_PEERCRED check"
+chmod +x approval/check-command.sh approval/approval-daemon approval/handle-approval.sh approval/approve
+git add approval/
+git commit -m "feat: add approval system — hook, daemon, CLI, rules"
 ```
 
 ---
 
-### Task 4: Auth Sidecar (Go Reverse Proxy)
+### Task 3: Claude Code Settings & Seccomp Profile
 
 **Files:**
-- Create: `sidecar/main.go`
-- Create: `sidecar/go.mod`
+- Create: `claude-settings.json`
+- Create: `seccomp-profile.json`
 
-- [ ] **Step 1: Initialize Go module**
+- [ ] **Step 1: Create `claude-settings.json`**
 
-```bash
-cd sidecar && go mod init github.com/claudetainer/sidecar && cd ..
-```
-
-- [ ] **Step 2: Write the sidecar proxy**
-
-`sidecar/main.go`:
-
-```go
-package main
-
-import (
-	"fmt"
-	"log"
-	"net/http"
-	"net/http/httputil"
-	"net/url"
-	"os"
-	"strings"
-	"time"
-)
-
-func main() {
-	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
-	ghPAT := os.Getenv("GH_PAT")
-	sidecarToken := os.Getenv("SIDECAR_TOKEN")
-
-	if anthropicKey == "" || ghPAT == "" || sidecarToken == "" {
-		log.Fatal("ANTHROPIC_API_KEY, GH_PAT, and SIDECAR_TOKEN must be set")
-	}
-
-	// Anthropic proxy on :4111
-	anthropicURL, _ := url.Parse("https://api.anthropic.com")
-	anthropicProxy := httputil.NewSingleHostReverseProxy(anthropicURL)
-	anthropicProxy.FlushInterval = -1 // Required for SSE streaming
-
-	anthropicMux := http.NewServeMux()
-	anthropicMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Validate sidecar token
-		if r.Header.Get("X-Claudetainer-Token") != sidecarToken {
-			log.Printf("[SIDECAR:4111] REJECTED (bad token) %s %s", r.Method, r.URL.Path)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		// Only allow expected API paths
-		if !strings.HasPrefix(r.URL.Path, "/v1/messages") && !strings.HasPrefix(r.URL.Path, "/v1/complete") {
-			log.Printf("[SIDECAR:4111] REJECTED (bad path) %s %s", r.Method, r.URL.Path)
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-
-		// Inject API key, remove sidecar token
-		r.Header.Set("x-api-key", anthropicKey)
-		r.Header.Set("anthropic-version", "2023-06-01")
-		r.Header.Del("X-Claudetainer-Token")
-
-		log.Printf("[SIDECAR:4111] PROXY %s %s", r.Method, r.URL.Path)
-		anthropicProxy.ServeHTTP(w, r)
-	})
-
-	// GitHub MCP proxy on :4112
-	githubURL, _ := url.Parse("https://api.githubcopilot.com")
-	githubProxy := httputil.NewSingleHostReverseProxy(githubURL)
-
-	githubMux := http.NewServeMux()
-	githubMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Validate sidecar token
-		if r.Header.Get("X-Claudetainer-Token") != sidecarToken {
-			log.Printf("[SIDECAR:4112] REJECTED (bad token) %s %s", r.Method, r.URL.Path)
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		// Only allow MCP endpoint pattern
-		if !strings.HasPrefix(r.URL.Path, "/mcp") {
-			log.Printf("[SIDECAR:4112] REJECTED (bad path) %s %s", r.Method, r.URL.Path)
-			http.Error(w, "Forbidden", http.StatusForbidden)
-			return
-		}
-
-		// Inject PAT, remove sidecar token
-		r.Header.Set("Authorization", fmt.Sprintf("Bearer %s", ghPAT))
-		r.Header.Del("X-Claudetainer-Token")
-
-		log.Printf("[SIDECAR:4112] PROXY %s %s", r.Method, r.URL.Path)
-		githubProxy.ServeHTTP(w, r)
-	})
-
-	// Start both servers
-	go func() {
-		server := &http.Server{
-			Addr:         "127.0.0.1:4111",
-			Handler:      anthropicMux,
-			ReadTimeout:  30 * time.Second,
-			WriteTimeout: 300 * time.Second, // Long timeout for SSE streaming
-		}
-		log.Println("[SIDECAR] Anthropic proxy listening on :4111")
-		log.Fatal(server.ListenAndServe())
-	}()
-
-	server := &http.Server{
-		Addr:         "127.0.0.1:4112",
-		Handler:      githubMux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-	}
-	log.Println("[SIDECAR] GitHub MCP proxy listening on :4112")
-	log.Fatal(server.ListenAndServe())
+```json
+{
+  "mcpServers": {
+    "bun-docs": {
+      "type": "http",
+      "url": "https://bun.com/docs/mcp"
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/opt/approval/check-command.sh",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
-- [ ] **Step 3: Tidy Go module**
+- [ ] **Step 2: Create `seccomp-profile.json`**
+
+Use Docker's default seccomp profile as the base (allowlist approach) and add explicit blocks for `bpf`, `mount`, `umount`, `umount2`, `ptrace`, `personality`, `unshare`, `setns`. The full default profile is large — generate it with:
 
 ```bash
-cd sidecar && go mod tidy && cd ..
+docker run --rm alpine cat /etc/docker/seccomp/default.json > seccomp-profile.json
 ```
 
-- [ ] **Step 4: Build and test locally**
+Then add the additional blocked syscalls to the profile. If running on Fly.io where custom seccomp profiles may not be supported via `fly.toml`, document this as a fallback that the other layers (cap-drop, no-new-privileges) provide equivalent protection for the specific syscalls we care about.
+
+- [ ] **Step 3: Commit**
 
 ```bash
-cd sidecar && go build -o auth-proxy . && cd ..
-# Verify binary was created
-ls -la sidecar/auth-proxy
-```
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add sidecar/
-git commit -m "feat: add Go auth sidecar with path validation and token auth"
+git add claude-settings.json seccomp-profile.json
+git commit -m "feat: add Claude settings template and seccomp profile"
 ```
 
 ---
 
-### Task 5: Network Refresh Script & Status Tool
+### Task 4: Status Tool
 
 **Files:**
-- Create: `network/refresh-iptables.sh`
 - Create: `status`
 
-- [ ] **Step 1: Write `network/refresh-iptables.sh`**
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-DOMAINS_FILE="/opt/network/domains.conf"
-RULES_FILE=$(mktemp)
-
-cat > "$RULES_FILE" <<'HEADER'
-*filter
-:INPUT ACCEPT [0:0]
-:FORWARD ACCEPT [0:0]
-:OUTPUT DROP [0:0]
--A OUTPUT -o lo -j ACCEPT
--A OUTPUT -d 169.254.0.0/16 -j DROP
--A OUTPUT -d 172.16.0.0/12 -j DROP
--A OUTPUT -p udp -d 127.0.0.53 --dport 53 -j ACCEPT
--A OUTPUT -p tcp -d 127.0.0.53 --dport 53 -j ACCEPT
--A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-HEADER
-
-# Resolve each domain and add rules
-while IFS= read -r domain || [[ -n "$domain" ]]; do
-  # Skip comments and blank lines
-  [[ "$domain" =~ ^[[:space:]]*# ]] && continue
-  [[ -z "$domain" ]] && continue
-  domain=$(echo "$domain" | tr -d '[:space:]')
-
-  # Resolve all IPs
-  ips=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
-  for ip in $ips; do
-    echo "-A OUTPUT -d $ip -j ACCEPT" >> "$RULES_FILE"
-  done
-done < "$DOMAINS_FILE"
-
-# Block remaining UDP (QUIC, tunneling)
-echo "-A OUTPUT -p udp -j DROP" >> "$RULES_FILE"
-
-# Log drops (rate-limited)
-echo "-A OUTPUT -j LOG --log-prefix \"CLAUDETAINER_DROP: \" --log-level 4 -m limit --limit 5/min" >> "$RULES_FILE"
-
-echo "COMMIT" >> "$RULES_FILE"
-
-# Atomic replacement
-iptables-restore < "$RULES_FILE"
-
-# IPv6: drop everything except loopback
-ip6tables -P OUTPUT DROP 2>/dev/null || true
-ip6tables -F OUTPUT 2>/dev/null || true
-ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-ip6tables -A OUTPUT -d fdaa::/16 -j DROP 2>/dev/null || true
-
-rm -f "$RULES_FILE"
-
-echo "[NETWORK] iptables refreshed at $(date)" >&2
-```
-
-- [ ] **Step 2: Write `status` script**
+- [ ] **Step 1: Create `status`**
 
 ```bash
 #!/usr/bin/env bash
@@ -804,10 +431,10 @@ echo ""
 
 echo "--- Active Approval Tokens ---"
 if [[ -d /run/claude-approved ]]; then
-  count=$(ls -1 /run/claude-approved/ 2>/dev/null | wc -l)
+  count=$(find /run/claude-approved -maxdepth 1 -type f 2>/dev/null | wc -l)
   echo "  Tokens: $count"
   for f in /run/claude-approved/*; do
-    [[ -f "$f" ]] && echo "  - $(cat "$f")"
+    [[ -f "$f" ]] && echo "  - $(cat "$f" 2>/dev/null || echo '(unreadable)')"
   done
 else
   echo "  (no token directory)"
@@ -818,43 +445,38 @@ echo "--- Recent iptables Drops ---"
 dmesg 2>/dev/null | grep "CLAUDETAINER_DROP" | tail -5 || echo "  (none)"
 echo ""
 
-echo "--- Sidecar Health ---"
-if curl -sf -o /dev/null http://127.0.0.1:4111/health 2>/dev/null; then
-  echo "  Anthropic proxy (:4111): UP"
-else
-  echo "  Anthropic proxy (:4111): DOWN"
-fi
-if curl -sf -o /dev/null http://127.0.0.1:4112/health 2>/dev/null; then
-  echo "  GitHub MCP proxy (:4112): UP"
-else
-  echo "  GitHub MCP proxy (:4112): DOWN"
-fi
-echo ""
-
 echo "--- Approval Daemon ---"
 if [[ -S /run/claude-approval.sock ]]; then
   echo "  Socket: active"
 else
   echo "  Socket: MISSING"
 fi
+echo ""
+
+echo "--- CoreDNS ---"
+if pgrep -x coredns >/dev/null 2>&1; then
+  echo "  Process: running"
+else
+  echo "  Process: NOT RUNNING"
+fi
 ```
 
-- [ ] **Step 3: Make executable, commit**
+- [ ] **Step 2: Make executable and commit**
 
 ```bash
-chmod +x network/refresh-iptables.sh status
-git add network/refresh-iptables.sh status
-git commit -m "feat: add iptables refresh script and status CLI"
+chmod +x status
+git add status
+git commit -m "feat: add status CLI tool"
 ```
 
 ---
 
-### Task 6: Entrypoint Script
+### Task 5: Entrypoint Script
 
 **Files:**
 - Create: `entrypoint.sh`
 
-- [ ] **Step 1: Write the entrypoint**
+- [ ] **Step 1: Create `entrypoint.sh`**
 
 ```bash
 #!/usr/bin/env bash
@@ -866,7 +488,8 @@ echo "[ENTRYPOINT] Starting claudetainer..."
 
 # Generate CoreDNS config from domains.conf
 COREFILE="/tmp/Corefile"
-cat /opt/network/Corefile.template > "$COREFILE"
+cp /opt/network/Corefile.template "$COREFILE"
+
 while IFS= read -r domain || [[ -n "$domain" ]]; do
   [[ "$domain" =~ ^[[:space:]]*# ]] && continue
   [[ -z "$domain" ]] && continue
@@ -882,84 +505,27 @@ EOF
 done < /opt/network/domains.conf
 
 # Start CoreDNS
-/usr/local/bin/coredns -conf "$COREFILE" -dns.port 53 -dns.addr 127.0.0.53 &
+/usr/local/bin/coredns -conf "$COREFILE" &
 sleep 1
 
-# Configure resolv.conf to use local CoreDNS
+# Point resolver to local CoreDNS
 echo "nameserver 127.0.0.53" > /etc/resolv.conf
 
 # Apply iptables rules
 /opt/network/refresh-iptables.sh
 
-# Start cron job for iptables refresh (every 30 min)
+# Start periodic iptables refresh (every 30 min)
 (while true; do sleep 1800; /opt/network/refresh-iptables.sh; done) &
 
-# Start 24-hour auto-stop timer
-(sleep 86400 && echo "[ENTRYPOINT] 24h lifetime reached, stopping..." && kill 1) &
-
 # === 2. Git configuration ===
+
 echo "https://${GH_PAT}@github.com" > /root/.git-credentials
 chmod 600 /root/.git-credentials
 git config --system credential.helper 'store --file=/root/.git-credentials'
 git config --system user.name "${GIT_AUTHOR_NAME:-claudetainer}"
 git config --system user.email "${GIT_AUTHOR_EMAIL:-claudetainer@noreply.github.com}"
 
-# === 3. Sidecar & Approval Daemon ===
-
-# Generate per-session sidecar token
-SIDECAR_TOKEN=$(head -c 32 /dev/urandom | xxd -p)
-export SIDECAR_TOKEN
-
-# Start sidecar (supervised restart loop)
-(while true; do
-  /opt/sidecar/auth-proxy 2>&1 | sed 's/^/[SIDECAR] /'
-  echo "[ENTRYPOINT] Sidecar exited, restarting in 1s..." >&2
-  sleep 1
-done) &
-
-# Start approval daemon (supervised restart loop)
-(while true; do
-  /opt/approval/approval-daemon 2>&1 | sed 's/^/[DAEMON] /'
-  echo "[ENTRYPOINT] Approval daemon exited, restarting in 1s..." >&2
-  sleep 1
-done) &
-
-# Wait for sidecar to be ready
-for i in $(seq 1 30); do
-  if curl -sf http://127.0.0.1:4111/ >/dev/null 2>&1; then break; fi
-  sleep 0.5
-done
-
-# === 3b. GitHub Packages npm registry auth ===
-# Configure bun/npm to authenticate with npm.pkg.github.com
-cat > /home/claude/.npmrc <<EOF
-//npm.pkg.github.com/:_authToken=${GH_PAT}
-EOF
-chown root:root /home/claude/.npmrc
-chmod 644 /home/claude/.npmrc
-# Note: .npmrc on read-only-like path. Since /home/claude is partly tmpfs,
-# we write this at boot. Claude can read it but it only contains the PAT
-# which is an accepted risk (same as gh config). The PAT is scoped.
-
-# Also configure bunfig.toml for scoped registries if needed
-cat > /home/claude/.bunfig.toml <<EOF
-[install.scopes]
-# Add org-scoped registry configs here, e.g.:
-# "@myorg" = { token = "${GH_PAT}", url = "https://npm.pkg.github.com/" }
-EOF
-chown root:root /home/claude/.bunfig.toml
-chmod 644 /home/claude/.bunfig.toml
-
-# === 4. Claude Code setup ===
-
-# Copy settings template, inject sidecar token
-mkdir -p /home/claude/.claude
-cp /opt/claude/settings.json /home/claude/.claude/settings.json
-sed -i "s/__SIDECAR_TOKEN__/$SIDECAR_TOKEN/g" /home/claude/.claude/settings.json
-chown root:root /home/claude/.claude/settings.json
-chmod 644 /home/claude/.claude/settings.json
-
-# Configure gh CLI
+# Configure gh CLI auth
 mkdir -p /opt/gh-config
 echo "$GH_PAT" | gh auth login --with-token --hostname github.com 2>/dev/null || true
 if [[ -d /root/.config/gh ]]; then
@@ -968,165 +534,163 @@ fi
 chmod 711 /opt/gh-config
 chmod 644 /opt/gh-config/* 2>/dev/null || true
 
+# Configure npm/bun auth for GitHub Packages
+cat > /home/claude/.npmrc <<EOF
+//npm.pkg.github.com/:_authToken=${GH_PAT}
+EOF
+chown root:root /home/claude/.npmrc
+chmod 644 /home/claude/.npmrc
+
+# === 3. Approval daemon ===
+
+(while true; do
+  /opt/approval/approval-daemon 2>&1
+  echo "[ENTRYPOINT] Approval daemon exited, restarting in 1s..." >&2
+  sleep 1
+done) &
+
+# === 4. Claude Code setup ===
+
+# Copy settings template (root-owned, mode 644 — Claude can read but not modify)
+mkdir -p /home/claude/.claude
+cp /opt/claude/settings.json /home/claude/.claude/settings.json
+chown root:root /home/claude/.claude/settings.json
+chmod 644 /home/claude/.claude/settings.json
+
 # Install superpowers plugin
 su -s /bin/bash claude -c 'claude plugin install superpowers@claude-plugins-official 2>/dev/null' || \
   echo "[ENTRYPOINT] WARNING: Failed to install superpowers plugin" >&2
 
 # === 5. Session startup ===
 
-# Ensure writable directories exist with correct ownership
-chown claude:claude /workspace /tmp /home/claude/.cache /home/claude/.claude 2>/dev/null || true
+# Set ownership on writable mounts (except .claude which stays root-owned)
+chown claude:claude /workspace /home/claude/.cache 2>/dev/null || true
 
-# Configure tmux
+# tmux config
 cat > /tmp/.tmux.conf <<'TMUX'
 set -g remain-on-exit on
 set -g history-limit 50000
 TMUX
 
-# Start tmux session as claude user
+# Start Claude Code in tmux as the claude user
 su -s /bin/bash claude -c "
-  export ANTHROPIC_API_BASE_URL=http://127.0.0.1:4111
   export GH_CONFIG_DIR=/opt/gh-config
   export HOME=/home/claude
   cd /workspace
   tmux -f /tmp/.tmux.conf new-session -d -s claude 'claude --dangerously-skip-permissions'
 "
 
-echo "[ENTRYPOINT] Claude Code session started. Attaching to tmux..."
-exec tmux attach -t claude
+echo "[ENTRYPOINT] Claude Code session started. Waiting for SSH connections..."
+
+# Keep the container alive — the entrypoint is PID 1
+# SSH users auto-attach to tmux via .bashrc
+exec sleep infinity
 ```
 
-- [ ] **Step 2: Make executable, commit**
+- [ ] **Step 2: Make executable and commit**
 
 ```bash
 chmod +x entrypoint.sh
 git add entrypoint.sh
-git commit -m "feat: add entrypoint with network lockdown, sidecar, approval daemon, tmux"
+git commit -m "feat: add entrypoint — network lockdown, git config, approval daemon, tmux"
 ```
 
 ---
 
-### Task 7: Dockerfile (Multi-Stage Build)
+### Task 6: Dockerfile
 
 **Files:**
 - Create: `Dockerfile`
 
-- [ ] **Step 1: Write the Dockerfile**
+- [ ] **Step 1: Create the Dockerfile**
 
 ```dockerfile
-# === Stage 1: Build sidecar ===
-FROM golang:1.22-bookworm AS sidecar-builder
-WORKDIR /build
-COPY sidecar/ .
-RUN go build -o auth-proxy .
-
-# === Stage 2: Final image ===
 FROM debian:bookworm-slim
 
-# Install system dependencies
+# System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    ca-certificates \
-    curl \
-    dnsutils \
-    fd-find \
-    git \
-    iptables \
-    ip6tables \
-    jq \
-    less \
-    python3 \
-    ripgrep \
-    socat \
-    tmux \
-    tree \
-    wget \
-    xxd \
+    bash ca-certificates curl dnsutils fd-find git iptables ip6tables \
+    jq less python3 ripgrep socat tmux tree wget xxd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Bun (pinned version)
+# Bun
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:${PATH}"
 
-# Install Claude Code
+# Claude Code
 RUN curl -fsSL https://claude.ai/install.sh | bash
 
-# Install gh CLI
+# gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    > /etc/apt/sources.list.d/github-cli.list \
     && apt-get update && apt-get install -y gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CoreDNS
-RUN curl -fsSL "https://github.com/coredns/coredns/releases/download/v1.12.1/coredns_1.12.1_linux_amd64.tgz" \
+# CoreDNS
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://github.com/coredns/coredns/releases/download/v1.12.1/coredns_1.12.1_linux_${ARCH}.tgz" \
     | tar -xz -C /usr/local/bin/ \
     && chmod +x /usr/local/bin/coredns
 
 # Create claude user
 RUN useradd -m -s /bin/bash -u 1000 claude
 
-# Copy sidecar binary from builder
-COPY --from=sidecar-builder /build/auth-proxy /opt/sidecar/auth-proxy
+# Auto-attach to tmux on SSH login
+RUN echo 'if [ -n "$SSH_CONNECTION" ] && tmux has-session -t claude 2>/dev/null; then exec tmux attach -t claude; fi' \
+    >> /root/.bashrc
 
-# Copy approval system
+# Approval system
 COPY approval/ /opt/approval/
 RUN chmod +x /opt/approval/*.sh /opt/approval/approve /opt/approval/approval-daemon
+RUN cp /opt/approval/approve /usr/local/bin/approve
 
-# Copy network config
+# Network config
 COPY network/ /opt/network/
 RUN chmod +x /opt/network/refresh-iptables.sh
 
-# Copy settings template
+# Claude settings template
 COPY claude-settings.json /opt/claude/settings.json
 
-# Copy seccomp profile (used by fly.toml or docker run)
-COPY seccomp-profile.json /opt/seccomp-profile.json
-
-# Copy status tool
+# Status tool
 COPY status /usr/local/bin/status
 RUN chmod +x /usr/local/bin/status
 
-# Copy approve CLI to a location accessible as root
-RUN cp /opt/approval/approve /usr/local/bin/approve
-
-# Copy entrypoint
+# Entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-# Create directories that will be tmpfs mounts
+# Writable mount targets
 RUN mkdir -p /workspace /home/claude/.cache /home/claude/.claude
 
 WORKDIR /workspace
-
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
-- [ ] **Step 2: Test Docker build locally**
+- [ ] **Step 2: Build locally to verify**
 
 ```bash
 docker build -t claudetainer:test .
 ```
 
-Verify the build completes without errors.
-
 - [ ] **Step 3: Commit**
 
 ```bash
 git add Dockerfile
-git commit -m "feat: add multi-stage Dockerfile with all security layers"
+git commit -m "feat: add Dockerfile with all security layers"
 ```
 
 ---
 
-### Task 8: Fly.io Configuration
+### Task 7: Fly.io Config & GitHub Actions
 
 **Files:**
 - Create: `fly.toml`
+- Create: `.github/workflows/build.yml`
 
-- [ ] **Step 1: Write `fly.toml`**
+- [ ] **Step 1: Create `fly.toml`**
 
 ```toml
 app = "claudetainer"
@@ -1139,97 +703,69 @@ primary_region = "ewr"
   size = "shared-cpu-1x"
   memory = 1024
 
-# IMPORTANT: No [services] or [[services]] block.
-# No ports are exposed to the internet.
-# Access is only via `fly ssh console`.
+# No [services] block — no ports exposed to the internet.
+# Access only via: fly ssh console
 ```
 
-- [ ] **Step 2: Commit**
-
-```bash
-git add fly.toml
-git commit -m "feat: add fly.toml with no exposed ports"
-```
-
----
-
-### Task 9: GitHub Actions CI/CD
-
-**Files:**
-- Create: `.github/workflows/deploy.yml`
-
-- [ ] **Step 1: Write the workflow**
+- [ ] **Step 2: Create `.github/workflows/build.yml`**
 
 ```yaml
-name: Build and Deploy
+name: Build and Push
 
 on:
   push:
     branches: [main]
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           tags: ghcr.io/${{ github.repository }}:latest
-
-      - name: Install flyctl
-        uses: superfly/flyctl-actions/setup-flyctl@master
-
-      - name: Deploy to Fly.io
-        run: fly deploy --image ghcr.io/${{ github.repository }}:latest
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 ```
 
-- [ ] **Step 2: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-git add .github/workflows/deploy.yml
-git commit -m "feat: add GitHub Actions workflow for GHCR + Fly deploy"
+git add fly.toml .github/workflows/build.yml
+git commit -m "feat: add fly.toml and GitHub Actions build workflow"
 ```
 
 ---
 
-### Task 10: Integration Testing & First Deploy
+### Task 8: Integration Test & First Deploy
 
-- [ ] **Step 1: Build the Docker image locally**
+- [ ] **Step 1: Build the image**
 
 ```bash
 docker build -t claudetainer:test .
 ```
 
-- [ ] **Step 2: Test the container locally (without Fly secrets)**
+- [ ] **Step 2: Test locally**
 
 ```bash
 docker run -it --rm \
   --cap-drop=ALL \
+  --cap-add=NET_ADMIN \
   --security-opt=no-new-privileges \
-  -e ANTHROPIC_API_KEY=test-key \
   -e GH_PAT=test-pat \
   -e GIT_AUTHOR_NAME=test-bot \
   -e GIT_AUTHOR_EMAIL=test@example.com \
-  -e GIT_COMMITTER_NAME=test-bot \
-  -e GIT_COMMITTER_EMAIL=test@example.com \
   --tmpfs /workspace:rw,size=512m \
   --tmpfs /tmp:rw,size=128m \
   --tmpfs /home/claude/.cache:rw,size=256m \
@@ -1237,62 +773,42 @@ docker run -it --rm \
   claudetainer:test
 ```
 
+Note: `CAP_NET_ADMIN` is needed for iptables setup in the entrypoint. The entrypoint runs as root and configures iptables before Claude (non-root) starts. On Fly.io, the VM has full root so this is not an issue.
+
 Verify:
 - CoreDNS starts and resolves allowlisted domains
-- iptables rules are applied
-- Sidecar starts on :4111 and :4112
-- Approval daemon starts
-- tmux session launches with Claude Code
+- iptables rules applied (check with `iptables -L -n`)
+- Approval daemon running (check socket exists)
+- tmux session started with Claude Code
 - `! status` shows healthy services
+- `! approve 'echo test'` writes a token
 
-- [ ] **Step 3: Create the Fly app**
+- [ ] **Step 3: Create the Fly app and set secrets**
 
 ```bash
 fly apps create claudetainer
+fly secrets set GH_PAT=<your-fine-grained-pat>
+fly machine run . \
+  --env GIT_AUTHOR_NAME=claudetainer-bot \
+  --env GIT_AUTHOR_EMAIL=claudetainer@noreply.github.com \
+  --env GIT_COMMITTER_NAME=claudetainer-bot \
+  --env GIT_COMMITTER_EMAIL=claudetainer@noreply.github.com \
+  --region ewr \
+  --vm-memory 1024
 ```
 
-- [ ] **Step 4: Set Fly secrets**
-
-```bash
-fly secrets set ANTHROPIC_API_KEY=<your-key> GH_PAT=<your-pat>
-```
-
-- [ ] **Step 5: Set environment variables and deploy**
-
-```bash
-fly deploy
-```
-
-- [ ] **Step 6: Connect and verify**
+- [ ] **Step 4: Connect and verify**
 
 ```bash
 fly ssh console
-tmux attach -t claude
+# Should auto-attach to tmux with Claude Code running
+# Complete OAuth login when prompted
+# Test: ! status
+# Test: ask Claude to "bun add react" — should require approval
 ```
 
-Verify Claude Code is running, test an approval flow (`bun add react`), verify `! status` works.
-
-- [ ] **Step 7: Commit any fixes from integration testing**
+- [ ] **Step 5: Commit any fixes**
 
 ```bash
-git add -A
-git commit -m "fix: integration test fixes from first deploy"
-```
-
----
-
-### Task 11: Documentation
-
-**Files:**
-- Create: `README.md` (only because user will need setup instructions)
-
-- [ ] **Step 1: Write minimal README**
-
-Cover: what this is, prerequisites (Fly account, GitHub PAT, Anthropic key), setup commands (`fly apps create`, `fly secrets set`, `fly deploy`), usage (`fly ssh console`, `tmux attach`, `! approve`), and the `! status` command.
-
-- [ ] **Step 2: Commit**
-
-```bash
-git add README.md
-git commit -m "docs: add setup and usage instructions"
+git add -A && git commit -m "fix: integration test fixes"
 ```
