@@ -123,6 +123,10 @@ iptables -A OUTPUT -d <deb.debian.org> -j ACCEPT
 
 # Bun
 iptables -A OUTPUT -d <bun.sh> -j ACCEPT
+iptables -A OUTPUT -d <bun.com> -j ACCEPT
+
+# GitHub Packages npm registry
+iptables -A OUTPUT -d <npm.pkg.github.com> -j ACCEPT
 
 # Block all UDP except DNS (prevents QUIC bypass, UDP tunneling)
 iptables -A OUTPUT -p udp -j DROP
