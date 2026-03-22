@@ -22,14 +22,14 @@ A Docker container deployed to Fly.io that provides a persistent, interactive Cl
 │  │  Writable: /workspace, /tmp, ~/.cache, ~/.claude     │    │
 │  │                                                      │    │
 │  │  tmux session "claude"                               │    │
-│  │  ├── claude --dangerously-skip-permissions            │    │
+│  │  ├── claude --dangerously-skip-permissions           │    │
 │  │  │   ├── PreToolUse hook (check-command.sh)          │    │
 │  │  │   │   └── reads rules.conf                        │    │
 │  │  │   └── MCP: Bun docs                               │    │
-│  │  │                                                    │    │
-│  │  Capabilities: NONE                                   │    │
-│  │  no-new-privileges: true                              │    │
-│  │  seccomp: restricted                                  │    │
+│  │  │                                                   │    │
+│  │  Capabilities: NONE                                  │    │
+│  │  no-new-privileges: true                             │    │
+│  │  seccomp: restricted                                 │    │
 │  └──────────────────────────────────────────────────────┘    │
 │                                                              │
 │  iptables (set by root, immutable to claude):                │
