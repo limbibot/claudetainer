@@ -176,8 +176,11 @@ Note: Write/Edit protection is no longer needed in the hook because the root fil
 
 ```
 # Auto-approve patterns (exit 0)
-allow:^git\s+(status|log|diff|branch|checkout|switch|add|commit|stash|rebase|merge|fetch|remote|show|rev-parse|symbolic-ref|config|init|reset|restore|cherry-pick|tag|bisect|blame|shortlog|describe|ls-files|ls-tree|rev-list|for-each-ref|name-rev|reflog)\b
+allow:^git\s+(status|log|diff|branch|checkout|switch|add|commit|stash|rebase|merge|fetch|show|rev-parse|symbolic-ref|config|init|reset|restore|cherry-pick|tag|bisect|blame|shortlog|describe|ls-files|ls-tree|rev-list|for-each-ref|name-rev|reflog)\b
 allow:^git\s+clone\b
+allow:^git\s+push\b
+allow:^git\s+remote\s*$
+allow:^git\s+remote\s+(-v|--verbose|show|get-url)\b
 allow:^(ls|cat|head|tail|cp|mv|mkdir|touch|tree|less)\b
 allow:^(grep|rg|fd|ag)\b
 allow:^bun (run|test|build|check)\b
@@ -220,6 +223,12 @@ block:.*/proc/
 # Prevent command execution via find/xargs arguments
 block:.*-exec\b
 block:.*\bxargs\b
+# Git safety: prevent destructive push and remote manipulation
+block:^git\s+push\s+.*--force\b
+block:^git\s+push\s+.*-f\b
+block:^git\s+push\s+.*--delete\b
+block:^git\s+push\s+.*-d\b
+block:^git\s+remote\s+(add|set-url|rename|remove)\b
 
 # Approval-required patterns (exit 2 with approval instructions)
 approve:^(apt-get|apt)\s+install\b
@@ -227,7 +236,6 @@ approve:^bun\s+(add|install)\b
 approve:^(pip3?|pipx)\s+install\b
 approve:^curl\b
 approve:^wget\b
-approve:^git\s+push\b
 
 # Default: block unmatched commands (allowlist model)
 # Use "allow" to switch to a denylist model if this is too restrictive
@@ -335,16 +343,27 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
 
 Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactive OAuth login on first use.
 
-**GitHub PAT scope:** Use a **fine-grained personal access token** (not classic) scoped to specific repositories only:
+**GitHub PAT scope:** Use a **fine-grained personal access token** (not classic) scoped to a **single repository**:
 
 | Permission | Access Level | Purpose |
 |-----------|-------------|---------|
-| Contents | Read & Write | Clone, pull, push commits |
-| Pull requests | Read & Write | Create and read PRs |
-| Issues | Read & Write | Create issues, comment |
+| Contents | Read & Write | Clone, pull, push to feature branches |
+| Pull requests | Read & Write | Create PRs, add comments/reviews |
+| Issues | Read & Write | Read issues, comment with PR links |
+| Actions | Read | Check CI status on PRs (`gh run view/list`) |
 | Metadata | Read (always included) | Basic repo info |
 
-**Permissions explicitly excluded:** Administration, Actions/Workflows, Packages, Pages, Secrets, Environments, Deployments. Fine-grained PATs **cannot create gists** (gists require classic tokens), which eliminates that exfiltration vector entirely. The token is scoped to specific repositories in the robot account's org — it cannot access other repos even if Claude crafts a `git remote add` to a different repo.
+**Permissions explicitly excluded:** Administration, Workflows (write), Packages, Pages, Secrets, Environments, Deployments. Fine-grained PATs **cannot create gists** (gists require classic tokens), eliminating that exfiltration vector. The token is scoped to a single repository — `git remote add` to other repos will fail at the GitHub API level. The hook also blocks `git remote add/set-url` as defense-in-depth.
+
+**PAT expiration:** Set to 90 days. Build rotation into operational runbook.
+
+**GitHub repository controls (required alongside the PAT):**
+
+- **Branch protection on `main`:** Require pull request reviews (minimum 1 reviewer), require status checks to pass, require linear history, do NOT allow the robot account to bypass protection rules
+- **CODEOWNERS for `.github/`:** Ensure workflow file changes require review by a security-aware team member: `.github/ @your-security-team`
+- **Secret scanning + push protection:** Enable on the repo to block accidental secret commits
+- **Branch naming convention:** Use GitHub Rulesets to restrict the robot account to creating branches matching `claude/**` only
+- **No self-approval:** GitHub prevents the robot account from approving its own PRs; a different human reviewer is always required
 
 ### Environment Variables (via `fly machine run --env`)
 
@@ -519,8 +538,9 @@ claudetainer/
 | Claude reads secrets from /proc | No secrets in Claude's environment; PAT only in root-owned files |
 | Claude runs `approve` via Bash tool | `block:^approve\b` in hook; `!` shell escape bypasses hooks (human-only) |
 | Claude uses command chaining to bypass hook | Hook splits compound commands (`;`, `&&`, `\|\|`, `$()`) and evaluates each sub-command independently |
-| Claude exfiltrates via `git push` | `git push` requires approval; PAT scoped to specific repos only |
-| Claude abuses `gh api` | Fine-grained PAT scope is the enforcement boundary; `gh api` can only do what the PAT allows |
+| Claude exfiltrates via `git push` | PAT scoped to single repo; branch protection requires human review; `git push --force/--delete` blocked |
+| Claude adds attacker remote | `git remote add/set-url` hard-blocked; PAT only works on scoped repo anyway |
+| Claude abuses `gh api` | Fine-grained PAT scoped to single repo; `gh api` can only do what the PAT allows |
 | Claude runs `sudo`, `rm -rf /` | Hook hard-blocks destructive commands |
 | Claude bypasses hook via eval/sh -c | `eval`, `exec`, `source`, `sh -c`, `bash -c` all hard-blocked |
 | Claude uses unknown command | `default:block` — unmatched commands are blocked (allowlist model) |
