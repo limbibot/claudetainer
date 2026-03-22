@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "[ENTRYPOINT] Starting claudetainer..."
+
+# === 1. Filesystem hardening ===
+# Mount tmpfs at writable paths before anything else
+mount -t tmpfs -o size=512m tmpfs /workspace
+mount -t tmpfs -o size=128m tmpfs /tmp
+mount -t tmpfs -o size=256m tmpfs /home/claude/.cache
+mount -t tmpfs -o size=64m tmpfs /home/claude/.claude
+chmod 1777 /tmp
+
+# Set ownership (except .claude which stays root-owned)
+chown claude:claude /workspace /home/claude/.cache
+
+# === 2. Network lockdown ===
+
+# Generate CoreDNS config from domains.conf
+COREFILE="/tmp/Corefile"
+cp /opt/network/Corefile.template "$COREFILE"
+
+while IFS= read -r domain || [[ -n "$domain" ]]; do
+  [[ "$domain" =~ ^[[:space:]]*# ]] && continue
+  [[ -z "$domain" ]] && continue
+  domain=$(echo "$domain" | tr -d '[:space:]')
+  cat >> "$COREFILE" <<EOF
+
+${domain} {
+    forward . 8.8.8.8 1.1.1.1
+    log
+    cache 300
+}
+EOF
+done < /opt/network/domains.conf
+
+# Start CoreDNS
+/usr/local/bin/coredns -conf "$COREFILE" &
+sleep 1
+
+# Point resolver to local CoreDNS
+echo "nameserver 127.0.0.53" > /etc/resolv.conf
+
+# Apply iptables rules
+/opt/network/refresh-iptables.sh
+
+# Start periodic iptables refresh (every 30 min)
+(while true; do sleep 1800; /opt/network/refresh-iptables.sh; done) &
+
+# === 3. Git configuration ===
+
+echo "https://${GH_PAT}@github.com" > /root/.git-credentials
+chmod 600 /root/.git-credentials
+git config --system credential.helper 'store --file=/root/.git-credentials'
+git config --system user.name "${GIT_USER_NAME:-claudetainer}"
+git config --system user.email "${GIT_USER_EMAIL:-claudetainer@noreply.github.com}"
+
+# Configure gh CLI auth
+mkdir -p /opt/gh-config
+echo "$GH_PAT" | gh auth login --with-token --hostname github.com 2>/dev/null || true
+if [[ -d /root/.config/gh ]]; then
+  cp -r /root/.config/gh/* /opt/gh-config/ 2>/dev/null || true
+fi
+chmod 711 /opt/gh-config
+chmod 644 /opt/gh-config/* 2>/dev/null || true
+
+# Configure npm/bun auth for GitHub Packages
+cat > /home/claude/.npmrc <<NPMRC
+//npm.pkg.github.com/:_authToken=${GH_PAT}
+NPMRC
+chown root:root /home/claude/.npmrc
+chmod 644 /home/claude/.npmrc
+
+# === 4. Approval setup ===
+mkdir -p /run/claude-approved
+
+# === 5. Claude Code setup ===
+
+# Copy settings template (root-owned, mode 644 — Claude can read but not modify)
+cp /opt/claude/settings.json /home/claude/.claude/settings.json
+chown root:root /home/claude/.claude/settings.json
+chmod 644 /home/claude/.claude/settings.json
+
+# Install superpowers plugin
+su -s /bin/bash claude -c 'claude plugin install superpowers@claude-plugins-official 2>/dev/null' || \
+  echo "[ENTRYPOINT] WARNING: Failed to install superpowers plugin" >&2
+
+# === 6. Lock filesystem ===
+# After all setup, remount root as read-only
+mount -o remount,ro /
+echo "[ENTRYPOINT] Root filesystem locked (read-only)"
+
+# === 7. Clone repo (optional) ===
+WORK_DIR="/workspace"
+if [[ -n "${REPO_URL:-}" ]]; then
+  echo "[ENTRYPOINT] Cloning $REPO_URL..."
+  su -s /bin/bash claude -c "git clone '$REPO_URL' /workspace/repo" || \
+    echo "[ENTRYPOINT] WARNING: Failed to clone $REPO_URL" >&2
+  if [[ -d /workspace/repo ]]; then
+    WORK_DIR="/workspace/repo"
+  fi
+fi
+
+# === 8. Session startup ===
+
+# tmux config (already on tmpfs at /tmp)
+cat > /tmp/.tmux.conf <<'TMUX'
+set -g remain-on-exit on
+set -g history-limit 50000
+TMUX
+
+# Start Claude Code in tmux as the claude user
+su -s /bin/bash claude -c "
+  export GH_CONFIG_DIR=/opt/gh-config
+  export HOME=/home/claude
+  cd '$WORK_DIR'
+  tmux -f /tmp/.tmux.conf new-session -d -s claude 'claude --dangerously-skip-permissions'
+"
+
+echo "[ENTRYPOINT] Claude Code session started. Waiting for SSH connections..."
+
+# Keep the container alive — the entrypoint is PID 1
+# SSH users auto-attach to tmux via .bashrc
+exec sleep infinity
