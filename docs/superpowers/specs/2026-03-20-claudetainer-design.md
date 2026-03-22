@@ -248,22 +248,21 @@ Both `block:` and `approve:` use exit code 2 (blocked). The difference is the st
 
 **Approval flow:**
 
-The `approve` CLI tool (`/usr/local/bin/approve`) communicates with a small root-owned **approval daemon** (`/opt/approval/approval-daemon`) that manages tokens. The daemon listens on a Unix domain socket (`/run/claude-approval.sock`). The token directory (`/run/claude-approved/`) is owned by root and writable only by root.
-
-**Socket authentication:** The daemon uses `SO_PEERCRED` on every incoming connection to verify the connecting process is running as root (UID 0). Connections from UID 1000 (claude) are rejected. This prevents Claude from self-approving commands by speaking the daemon protocol directly via Python or Bun. The `approve` CLI is a setuid-root binary — wait, `no-new-privileges` blocks setuid. Instead: the `approve` CLI is owned by root and runs as a separate process spawned by the entrypoint (not by Claude). When the user types `! approve 'cmd'`, Claude Code's shell escape runs `/usr/local/bin/approve` which inherits the user's UID. Since the user SSHes in as root (Fly default), the approve CLI runs as root and passes the `SO_PEERCRED` check. Claude's own processes run as UID 1000 and are rejected.
+The `approve` CLI tool (`/usr/local/bin/approve`) is a simple bash script that writes a one-shot token file. No daemon, no socket — just a file write. The token directory (`/run/claude-approved/`) is created by the entrypoint at boot.
 
 1. Claude runs `bun add react`
 2. Hook matches `approve:^bun\s+(add|install)\b` → exits 2 with instructions
-3. User types `! approve 'bun add react'` in Claude Code prompt
-4. `approve` CLI sends the command string to the approval daemon via the Unix socket
-5. Daemon computes SHA256 hash and writes token to `/run/claude-approved/<hash>` (root-owned directory)
-6. Claude retries `bun add react`
-7. Hook computes the same hash, finds the matching token → deletes it → exits 0
-8. Command executes (network request succeeds because `registry.npmjs.org` is in the iptables allowlist)
+3. User types `! approve 'bun add react'` in Claude Code's shell escape prompt
+4. `approve` script computes SHA256 hash of the command string and writes it to `/run/claude-approved/<hash>`
+5. Claude retries `bun add react`
+6. Hook computes the same hash, finds the matching token → deletes it → exits 0
+7. Command executes (network request succeeds because `registry.npmjs.org` is in the iptables allowlist)
 
 Approvals are **one-shot**: each token is consumed on use. Approving `bun add react` does not approve `bun add malicious-package`. Tokens are cleared on container restart.
 
-**Self-approval prevention:** `block:^approve\b` prevents Claude from running the `approve` command via the Bash tool. Even if Claude bypassed this, writing directly to the token directory fails because it is root-owned (mode 0700). The Unix socket only accepts writes from the `approve` CLI, which Claude cannot execute through the hook.
+**Self-approval prevention:** `block:^approve\b` prevents Claude from running the `approve` command via the Bash tool. The `!` shell escape in Claude Code bypasses hooks entirely (it's a direct user command, not a tool invocation), so the human can always run `! approve`. Claude cannot use `!` — only the human operator can.
+
+**Accepted risk:** Claude could theoretically forge tokens via Python (`open('/run/claude-approved/<hash>', 'w')`). This is the same class of accepted risk as Python making HTTP requests to allowlisted domains — bounded by the network layer and PAT scope. The practical attack requires Claude to know the exact hash format and token directory path.
 
 **Why this works with Layer 2:** The iptables allowlist permits traffic to package registries, but the hook gates which install commands actually run. Claude can't bypass the hook to run `bun add evil-package` because the hook fires on every Bash tool invocation even in `--dangerously-skip-permissions` mode. The two layers complement: iptables blocks unknown domains, the hook blocks unapproved commands to known domains.
 
@@ -378,8 +377,8 @@ Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactiv
    - Set git identity from `$GIT_USER_NAME` / `$GIT_USER_EMAIL` env vars
    - Configure `gh` CLI auth: `echo "$GH_PAT" | gh auth login --with-token` writing to `/opt/gh-config/hosts.yml` (root-owned directory, mode 711; file mode 644). Set `GH_CONFIG_DIR=/opt/gh-config` in Claude's environment.
    - Configure npm/bun auth for GitHub Packages: write `.npmrc` with `//npm.pkg.github.com/:_authToken=${GH_PAT}` to `/home/claude/.npmrc` (root-owned, mode 644)
-4. **Approval daemon startup:**
-   - Start the approval daemon on Unix socket `/run/claude-approval.sock` (supervised restart loop)
+4. **Approval setup:**
+   - Create `/run/claude-approved/` directory for approval tokens
 5. **Claude Code setup:**
    - Copy settings template from `/opt/claude/settings.json` to `/home/claude/.claude/settings.json` (tmpfs, root-owned, mode 644 — Claude can read but not modify, preventing hook removal mid-session)
    - Install superpowers plugin (log warning on failure)
@@ -452,8 +451,7 @@ claudetainer/
 ├── approval/
 │   ├── check-command.sh       # PreToolUse hook script
 │   ├── rules.conf             # Configurable allow/approve/block patterns
-│   ├── approve                # CLI tool: sends approval requests to daemon
-│   └── approval-daemon        # Root-owned daemon: manages approval tokens
+│   └── approve                # CLI tool: writes one-shot approval tokens
 ├── network/
 │   ├── domains.conf           # Domain allowlist (one per line, shared by iptables + CoreDNS)
 │   ├── Corefile.template      # CoreDNS config template: base with NXDOMAIN default
@@ -469,8 +467,7 @@ claudetainer/
 | `entrypoint.sh` | Container startup: network lockdown, git config, approval daemon, tmux |
 | `check-command.sh` | PreToolUse hook: reads rules.conf, splits compounds, enforces tiers |
 | `rules.conf` | Configurable allow/approve/block regex patterns for Bash commands |
-| `approve` | CLI tool: sends approval hash to daemon via Unix socket |
-| `approval-daemon` | Root-owned: listens on Unix socket, writes tokens to root-owned directory |
+| `approve` | CLI tool: writes one-shot approval token (SHA256 hash of command) |
 | `domains.conf` | Domain allowlist: shared by iptables + CoreDNS |
 | `Corefile.template` | CoreDNS base config; entrypoint generates final Corefile from domains.conf |
 | `refresh-iptables.sh` | Cron job (every 30m): re-resolves domains, atomic `iptables-restore` |
@@ -483,9 +480,9 @@ claudetainer/
 
 **iptables logging:** Dropped packets are logged with the prefix `CLAUDETAINER_DROP:` (rate-limited to 5/min to prevent log flooding). Viewable via `fly logs` or `dmesg`.
 
-**Approval logging:** The approval daemon logs all approval requests (who approved what, when) to stdout.
+**Approval logging:** The `approve` CLI prints each approval to stdout (visible in the user's terminal).
 
-**Monitoring command:** Users can run `! status` (a script at `/usr/local/bin/status`) to see: active approval tokens, recent blocked commands, recent iptables drops, approval daemon health.
+**Monitoring command:** Users can run `! status` (a script at `/usr/local/bin/status`) to see: active approval tokens, recent blocked commands, recent iptables drops, CoreDNS health.
 
 ## Operational Security Notes
 
@@ -521,7 +518,7 @@ claudetainer/
 | Claude exfiltrates Anthropic credentials | Claude Code uses OAuth; tokens are session-scoped on tmpfs, lost on restart |
 | Claude exfiltrates GitHub PAT | PAT in root-owned files (mode 600); readable via gh config (accepted risk — scoped, gh api blocked, can't reach non-allowlisted domains) |
 | Claude reads secrets from /proc | No secrets in Claude's environment; PAT only in root-owned files |
-| Claude self-approves via socket | Approval daemon socket mode 0600 (root-only); Claude (UID 1000) cannot connect |
+| Claude runs `approve` via Bash tool | `block:^approve\b` in hook; `!` shell escape bypasses hooks (human-only) |
 | Claude uses command chaining to bypass hook | Hook splits compound commands (`;`, `&&`, `\|\|`, `$()`) and evaluates each sub-command independently |
 | Claude exfiltrates via `git push` | `git push` requires approval; PAT scoped to specific repos only |
 | Claude bypasses gh blocks via `gh api` | `gh api` is hard-blocked |
@@ -529,13 +526,12 @@ claudetainer/
 | Claude bypasses hook via eval/sh -c | `eval`, `exec`, `source`, `sh -c`, `bash -c` all hard-blocked |
 | Claude uses unknown command | `default:block` — unmatched commands are blocked (allowlist model) |
 | Claude installs malicious package | Hook requires per-command approval for all install commands |
-| Claude self-approves commands | `approve` blocked by hook; token directory root-owned (mode 0700) |
-| Claude forges approval tokens | Token directory writable only by root-owned approval daemon |
+| Claude self-approves commands | `approve` blocked by hook; Python forgery is accepted risk (bounded by network layer) |
 | Claude bypasses via QUIC/UDP | All UDP dropped except DNS |
 | Claude injects into other tmux panes | `tmux send-keys/capture-pane/pipe-pane` hard-blocked |
 | Claude exfiltrates via gh gist/repo | `gh gist`, `gh repo create`, `gh repo delete`, `gh auth` hard-blocked |
 | Claude accesses cloud metadata | `169.254.0.0/16` explicitly dropped in iptables |
-| Approval daemon/hook killed | Claude lacks capabilities to signal root-owned processes |
+| Hook process killed | Hook runs per-invocation, not as a daemon; nothing to kill |
 | iptables modified | Claude lacks `CAP_NET_ADMIN` |
 | CDN IP rotation breaks allowlist | Background cron re-resolves with atomic `iptables-restore` every 30 minutes |
 | Supply chain compromise at build | Version-pinned installs with SHA256 verification; multi-stage Docker build; GHCR scanning |

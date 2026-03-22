@@ -21,10 +21,8 @@ claudetainer/
 ├── entrypoint.sh
 ├── approval/
 │   ├── check-command.sh
-│   ├── handle-approval.sh
 │   ├── rules.conf
-│   ├── approve
-│   └── approval-daemon
+│   └── approve
 ├── network/
 │   ├── domains.conf
 │   ├── Corefile.template
@@ -152,8 +150,6 @@ git commit -m "feat: add network config — domains, CoreDNS template, iptables 
 **Files:**
 - Create: `approval/rules.conf`
 - Create: `approval/check-command.sh`
-- Create: `approval/approval-daemon`
-- Create: `approval/handle-approval.sh`
 - Create: `approval/approve`
 
 - [ ] **Step 1: Create `approval/rules.conf`**
@@ -276,63 +272,15 @@ split_and_evaluate "$COMMAND"
 exit $?
 ```
 
-- [ ] **Step 3: Create `approval/approval-daemon`**
+- [ ] **Step 3: Create `approval/approve`**
 
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SOCKET="/run/claude-approval.sock"
-APPROVED_DIR="/run/claude-approved"
-
-cleanup() { rm -f "$SOCKET"; }
-trap cleanup EXIT
-
-mkdir -p "$APPROVED_DIR"
-chmod 733 "$APPROVED_DIR"
-rm -f "$SOCKET"
-
-echo "[APPROVAL-DAEMON] Listening on $SOCKET" >&2
-
-while true; do
-  socat -u UNIX-LISTEN:"$SOCKET",fork,mode=0600 \
-    EXEC:"/opt/approval/handle-approval.sh" 2>/dev/null || true
-done
-```
-
-- [ ] **Step 4: Create `approval/handle-approval.sh`**
+Simple script that writes a one-shot token file. No daemon, no socket.
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 
 APPROVED_DIR="/run/claude-approved"
-
-read -r CMD
-if [[ -z "$CMD" ]]; then
-  echo "ERROR: empty command" >&2
-  exit 1
-fi
-
-HASH=$(echo -n "$CMD" | sha256sum | cut -d' ' -f1)
-echo "$CMD" > "$APPROVED_DIR/$HASH"
-chmod 666 "$APPROVED_DIR/$HASH"
-echo "[APPROVAL-DAEMON] Token written for: $CMD (hash: ${HASH:0:12}...)" >&2
-echo "OK"
-```
-
-- [ ] **Step 5: Create `approval/approve`**
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-SOCKET="/run/claude-approval.sock"
-
-if [[ "$(id -u)" != "0" ]]; then
-  echo "⛔ approve must be run as root (use ! approve from Claude Code)" >&2
-  exit 1
-fi
 
 if [[ $# -eq 0 ]]; then
   echo "Usage: approve '<command>'" >&2
@@ -341,22 +289,20 @@ if [[ $# -eq 0 ]]; then
 fi
 
 CMD="$*"
-RESPONSE=$(echo "$CMD" | socat - UNIX-CONNECT:"$SOCKET" 2>/dev/null)
-
-if [[ "$RESPONSE" == "OK" ]]; then
-  echo "✅ Approved: $CMD"
-else
-  echo "❌ Failed to approve: $CMD" >&2
-  exit 1
-fi
+mkdir -p "$APPROVED_DIR"
+HASH=$(echo -n "$CMD" | sha256sum | cut -d' ' -f1)
+echo "$CMD" > "$APPROVED_DIR/$HASH"
+echo "✅ Approved: $CMD"
 ```
 
-- [ ] **Step 6: Make all executable and commit**
+The user runs this via `! approve 'cmd'` in Claude Code's shell escape. The `!` escape bypasses the PreToolUse hook entirely (it's a direct user command, not a tool invocation). Claude cannot call `approve` via the Bash tool because `block:^approve\b` catches it.
+
+- [ ] **Step 4: Make all executable and commit**
 
 ```bash
-chmod +x approval/check-command.sh approval/approval-daemon approval/handle-approval.sh approval/approve
+chmod +x approval/check-command.sh approval/approve
 git add approval/
-git commit -m "feat: add approval system — hook, daemon, CLI, rules"
+git commit -m "feat: add approval system — hook, approve CLI, rules"
 ```
 
 ---
@@ -431,14 +377,6 @@ echo ""
 
 echo "--- Recent iptables Drops ---"
 dmesg 2>/dev/null | grep "CLAUDETAINER_DROP" | tail -5 || echo "  (none)"
-echo ""
-
-echo "--- Approval Daemon ---"
-if [[ -S /run/claude-approval.sock ]]; then
-  echo "  Socket: active"
-else
-  echo "  Socket: MISSING"
-fi
 echo ""
 
 echo "--- CoreDNS ---"
@@ -540,13 +478,8 @@ NPMRC
 chown root:root /home/claude/.npmrc
 chmod 644 /home/claude/.npmrc
 
-# === 4. Approval daemon ===
-
-(while true; do
-  /opt/approval/approval-daemon 2>&1
-  echo "[ENTRYPOINT] Approval daemon exited, restarting in 1s..." >&2
-  sleep 1
-done) &
+# === 4. Approval setup ===
+mkdir -p /run/claude-approved
 
 # === 5. Claude Code setup ===
 
@@ -621,7 +554,7 @@ FROM debian:bookworm-slim
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl dnsutils fd-find git iptables ip6tables \
-    jq less python3 ripgrep socat tmux tree wget xxd \
+    jq less python3 ripgrep tmux tree wget xxd \
     && rm -rf /var/lib/apt/lists/*
 
 # Bun
@@ -655,7 +588,7 @@ RUN echo 'if [ -n "$SSH_CONNECTION" ] && tmux has-session -t claude 2>/dev/null;
 
 # Approval system
 COPY approval/ /opt/approval/
-RUN chmod +x /opt/approval/*.sh /opt/approval/approve /opt/approval/approval-daemon
+RUN chmod +x /opt/approval/*.sh /opt/approval/approve
 RUN cp /opt/approval/approve /usr/local/bin/approve
 
 # Network config
