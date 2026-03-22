@@ -2,9 +2,12 @@ FROM debian:bookworm-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash ca-certificates curl dnsutils fd-find git iptables ip6tables \
-    jq just less python3 ripgrep tmux tree wget xxd \
+    bash ca-certificates curl dnsutils fd-find git iptables \
+    jq less python3 ripgrep tmux tree wget xxd \
     && rm -rf /var/lib/apt/lists/*
+
+# just (not in Debian repos — install from official prebuilt binary)
+RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
 # Bun
 RUN curl -fsSL https://bun.sh/install | bash
