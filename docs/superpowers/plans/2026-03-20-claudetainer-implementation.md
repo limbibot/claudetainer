@@ -554,7 +554,7 @@ FROM debian:bookworm-slim
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     bash ca-certificates curl dnsutils fd-find git iptables ip6tables \
-    jq less python3 ripgrep tmux tree wget xxd \
+    jq just less python3 ripgrep tmux tree wget xxd \
     && rm -rf /var/lib/apt/lists/*
 
 # Bun

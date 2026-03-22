@@ -184,6 +184,7 @@ allow:^git\s+remote\s+(-v|--verbose|show|get-url)\b
 allow:^(ls|cat|head|tail|cp|mv|mkdir|touch|tree|less)\b
 allow:^(grep|rg|fd|ag)\b
 allow:^bun (run|test|build|check)\b
+allow:^just\b
 allow:^(python3?)\b
 allow:^(echo|pwd|cd|which)\b
 allow:^(wc|sort|uniq|diff|sed|awk|tee|basename|dirname)\b
@@ -309,7 +310,7 @@ The entrypoint configures `gh` auth writing to `/opt/gh-config/hosts.yml` (root-
 - **Python 3** — Claude Code frequently uses it for scripting tasks
 - **Claude Code** — installed via `curl -fsSL https://claude.ai/install.sh | bash` with version pinned and binary checksum verified post-install
 - **gh** — GitHub CLI, installed from GitHub's official apt repo with version pinned
-- **CLI tools:** jq, ripgrep, fd-find, git, curl, wget, tmux, less, tree
+- **CLI tools:** jq, ripgrep, fd-find, git, curl, wget, tmux, less, tree, just
 - **iptables** — for network boundary enforcement
 - **CoreDNS** — local DNS resolver that only resolves allowlisted domains
 
