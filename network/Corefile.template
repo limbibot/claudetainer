@@ -1,0 +1,12 @@
+# Default: return NXDOMAIN for all queries
+# Per-domain forward blocks are appended by the entrypoint
+. {
+    log
+    errors
+    template IN A . {
+        rcode NXDOMAIN
+    }
+    template IN AAAA . {
+        rcode NXDOMAIN
+    }
+}
