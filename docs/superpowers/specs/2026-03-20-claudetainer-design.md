@@ -237,7 +237,8 @@ block:^git\s+push\s+.*--tags
 
 # Approval-required patterns (exit 2 with approval instructions)
 approve:^(apt-get|apt)\s+install\b
-approve:^bun\s+(add|install)\b
+approve:^bun\s+(add|install|x)\b
+approve:^bunx\b
 approve:^(pip3?|pipx)\s+install\b
 approve:^curl\b
 approve:^wget\b
