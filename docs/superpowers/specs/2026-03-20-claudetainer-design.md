@@ -449,16 +449,26 @@ GHCR authentication uses the built-in `GITHUB_TOKEN` provided by GitHub Actions 
 Fly.io deployment is done manually — no `fly.toml` needed:
 
 ```bash
-fly machine run ghcr.io/<org>/claudetainer:latest \
-  --app claudetainer \
+fly machine run ghcr.io/perezd/claudetainer:latest \
+  --app $APP_NAME \
+  --org $ORG_NAME \
+  --name $MACHINE_NAME \
   --region sjc \
+  --restart no \
+  --autostart=false \
+  --skip-dns-registration \
   --vm-memory 1024 \
   --vm-size shared-cpu-1x \
-  --env GIT_USER_NAME=claudetainer-bot \
-  --env GIT_USER_EMAIL=claudetainer@noreply.github.com
+  --env GIT_USER_NAME=limbibot \
+  --env GIT_USER_EMAIL=limbibot@limbic.systems
 ```
 
 To auto-clone a repo at startup, add `--env REPO_URL=https://github.com/your-org/your-repo`.
+
+Key flags:
+- `--restart no` — manual restarts only (no auto-restart on exit)
+- `--autostart=false` — don't start on network requests (no ports exposed anyway)
+- `--skip-dns-registration` — prevents discoverability via Fly's internal 6PN DNS, reinforcing the private-network iptables block
 
 Secrets (`GH_PAT`) are set once via `fly secrets set` on the app and automatically available to all machines.
 

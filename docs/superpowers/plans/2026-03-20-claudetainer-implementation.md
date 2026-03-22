@@ -694,6 +694,9 @@ fly secrets set GH_PAT=<your-fine-grained-pat>
 fly machine run ghcr.io/<org>/claudetainer:latest \
   --app claudetainer \
   --region sjc \
+  --restart no \
+  --autostart=false \
+  --skip-dns-registration \
   --vm-memory 1024 \
   --vm-size shared-cpu-1x \
   --env GIT_USER_NAME=claudetainer-bot \
@@ -706,6 +709,9 @@ Optionally, to auto-clone a repo on start:
 fly machine run ghcr.io/<org>/claudetainer:latest \
   --app claudetainer \
   --region sjc \
+  --restart no \
+  --autostart=false \
+  --skip-dns-registration \
   --vm-memory 1024 \
   --vm-size shared-cpu-1x \
   --env GIT_USER_NAME=claudetainer-bot \
