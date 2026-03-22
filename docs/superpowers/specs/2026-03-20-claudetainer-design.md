@@ -359,14 +359,11 @@ Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactiv
 
 **Permissions explicitly excluded:** Administration, Workflows (write), Packages, Pages, Secrets, Environments, Deployments. Fine-grained PATs **cannot create gists** (gists require classic tokens), eliminating that exfiltration vector. The token is scoped to a single repository — `git remote add` to other repos will fail at the GitHub API level. The hook also blocks `git remote add/set-url` as defense-in-depth.
 
-**PAT expiration:** Set to 90 days. Build rotation into operational runbook.
-
 **GitHub repository controls (required alongside the PAT):**
 
 - **Branch protection on `main`:** Require pull request reviews (minimum 1 reviewer), require status checks to pass, require linear history, do NOT allow the robot account to bypass protection rules
 - **CODEOWNERS for `.github/`:** Ensure workflow file changes require review by a security-aware team member: `.github/ @your-security-team`
 - **Secret scanning + push protection:** Enable on the repo to block accidental secret commits
-- **Branch naming convention:** Use GitHub Rulesets to restrict the robot account to creating branches matching `claude/**` only
 - **No self-approval:** GitHub prevents the robot account from approving its own PRs; a different human reviewer is always required
 
 ### Environment Variables (via `fly machine run --env`)

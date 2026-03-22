@@ -154,7 +154,7 @@ git commit -m "feat: add network config — domains, CoreDNS template, iptables 
 
 - [ ] **Step 1: Create `approval/rules.conf`**
 
-Copy the rules verbatim from spec lines 176-233.
+Copy the rules verbatim from the `rules.conf` block in the spec (lines 178-247).
 
 - [ ] **Step 2: Create `approval/check-command.sh`**
 
