@@ -9,6 +9,11 @@ mount -t tmpfs -o size=512m tmpfs /workspace
 mount -t tmpfs -o size=128m tmpfs /tmp
 mount -t tmpfs -o size=256m tmpfs /home/claude/.cache
 mount -t tmpfs -o size=64m tmpfs /home/claude/.claude
+mount -t tmpfs -o size=8m tmpfs /root
+# Recreate .bashrc on tmpfs (original is hidden by the mount)
+cat > /root/.bashrc <<'BASHRC'
+if [ -n "$SSH_CONNECTION" ] && tmux has-session -t claude 2>/dev/null; then exec tmux attach -t claude; fi
+BASHRC
 chmod 1777 /tmp
 
 # Set ownership (except .claude which stays root-owned)
