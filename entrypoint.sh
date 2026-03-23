@@ -103,6 +103,7 @@ fi
 cat > /tmp/.tmux.conf <<'TMUX'
 set -g remain-on-exit on
 set -g history-limit 50000
+set -g default-terminal "xterm-256color"
 TMUX
 
 # Start Claude Code in tmux as the claude user
