@@ -12,8 +12,10 @@ fi
 if ! su -s /bin/bash claude -c "HOME=$CLAUDE_HOME claude auth status" >/dev/null 2>&1; then
   echo ""
   echo "=== Claude Code Authentication Required ==="
+  echo "Running auth as claude user..."
   echo ""
-  sudo -u claude HOME=$CLAUDE_HOME claude auth login
+  # Use script(1) to allocate a proper PTY for the claude user
+  script -q -c "su -s /bin/bash claude -c 'HOME=$CLAUDE_HOME claude auth login'" /dev/null
   echo ""
 fi
 
