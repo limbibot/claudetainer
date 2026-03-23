@@ -34,11 +34,18 @@ echo "COMMIT" >> "$RULES_FILE"
 
 iptables-restore < "$RULES_FILE"
 
-ip6tables -P OUTPUT DROP 2>/dev/null || true
-ip6tables -F OUTPUT 2>/dev/null || true
-ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
-# Allow established connections (needed for SSH responses over Fly's fdaa:: network)
-ip6tables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+# IPv6 rules: use ip6tables-restore for atomic application (no window where
+# policy is DROP but rules are flushed, which would kill active SSH sessions)
+ip6tables-restore 2>/dev/null <<'IP6RULES' || true
+*filter
+:INPUT ACCEPT [0:0]
+:FORWARD ACCEPT [0:0]
+:OUTPUT DROP [0:0]
+-A OUTPUT -o lo -j ACCEPT
+-A OUTPUT -d fdaa::/16 -j ACCEPT
+-A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+COMMIT
+IP6RULES
 
 rm -f "$RULES_FILE"
 echo "[NETWORK] iptables refreshed at $(date)" >&2
