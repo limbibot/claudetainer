@@ -8,16 +8,17 @@ if tmux -S "$TMUX_SOCKET" has-session -t claude 2>/dev/null; then
   exec tmux -S "$TMUX_SOCKET" attach -t claude
 fi
 
-# First time: ensure Claude Code is authenticated
-if ! su -s /bin/bash claude -c "HOME=$CLAUDE_HOME claude auth status" >/dev/null 2>&1; then
+# Check that the OAuth token is available
+if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
   echo ""
-  echo "=== Claude Code Authentication Required ==="
+  echo "ERROR: CLAUDE_CODE_OAUTH_TOKEN is not set."
   echo ""
-  echo "Generate a token at: https://console.anthropic.com/settings/keys"
-  echo "Then paste it below."
+  echo "To authenticate:"
+  echo "  1. Run 'claude setup-token' on your local machine"
+  echo "  2. fly secrets set CLAUDE_CODE_OAUTH_TOKEN=<token> -a <app>"
+  echo "  3. Restart the machine"
   echo ""
-  su -s /bin/bash claude -c "HOME=$CLAUDE_HOME claude setup-token"
-  echo ""
+  exit 1
 fi
 
 # Write tmux config
@@ -38,6 +39,7 @@ fi
 su -s /bin/bash claude -c "
   export GH_CONFIG_DIR=/opt/gh-config
   export HOME=$CLAUDE_HOME
+  export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'
   cd '$WORK_DIR'
   tmux -f /tmp/.tmux.conf new-session -d -s claude 'claude --dangerously-skip-permissions'
 "

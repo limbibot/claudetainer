@@ -283,7 +283,7 @@ Approvals are **one-shot**: each token is consumed on use. Approving `bun add re
 
 ### Credential Management
 
-**Claude Code authentication:** Claude Code uses interactive OAuth login. The user authenticates on first use after each container start. OAuth tokens are stored by Claude Code in `/home/claude/.claude/` (tmpfs) — they persist for the session but are lost on container restart, requiring re-authentication.
+**Claude Code authentication:** Claude Code authenticates via a long-lived OAuth token set as the `CLAUDE_CODE_OAUTH_TOKEN` Fly secret. The token is generated once on the user's local machine via `claude setup-token` and passed to the container as an environment variable. No interactive login or browser flow is needed. The `start-claude` script passes this token to the claude user's environment when launching tmux.
 
 **Git credential isolation:**
 
@@ -348,8 +348,7 @@ Installed at first boot by the entrypoint script via `claude plugin install supe
 | Secret | Purpose |
 |--------|---------|
 | `GH_PAT` | Git HTTPS auth, gh CLI — stored in root-owned config files, never in Claude's environment |
-
-Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactive OAuth login on first use.
+| `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code auth — generated via `claude setup-token` on local machine, passed to claude user at runtime |
 
 **GitHub PAT scope:** Use a **fine-grained personal access token** (not classic) scoped to a **single repository**:
 
@@ -409,26 +408,24 @@ Note: No `ANTHROPIC_API_KEY` is needed. Claude Code authenticates via interactiv
 7. **Repository clone (optional):**
    - If `$REPO_URL` is set, clone it into `/workspace` as the `claude` user: `su -s /bin/bash claude -c "git clone $REPO_URL /workspace/repo"`
    - Claude Code starts inside the cloned repo directory
-8. **Session startup:**
-   - Start tmux session as `claude` user with `remain-on-exit on`
-   - In tmux: `cd /workspace/repo` (if cloned) or `cd /workspace`, then run `claude --dangerously-skip-permissions`
-   - Keep container alive with `exec sleep infinity` (SSH users auto-attach via `.bashrc`)
+8. **Keep alive:**
+   - `exec sleep infinity` — entrypoint stays running as PID 1
+   - Claude Code is NOT started by the entrypoint — it's started by `start-claude` on first SSH
 
 ### Connecting
 
 ```bash
-fly ssh console
+fly ssh console -a <app>
 ```
 
-The root user's `.bashrc` auto-attaches to the Claude tmux session on SSH login:
+**First SSH:** `.bashrc` calls `start-claude`, which:
+1. Checks `CLAUDE_CODE_OAUTH_TOKEN` is set (errors if not)
+2. Starts Claude Code in a tmux session with `--dangerously-skip-permissions`
+3. Attaches to the tmux session
 
-```bash
-if [ -n "$SSH_CONNECTION" ] && tmux has-session -t claude 2>/dev/null; then
-  exec tmux attach -t claude
-fi
-```
+**Subsequent SSHs:** `.bashrc` detects the existing tmux session and attaches directly.
 
-This is baked into the image so `fly ssh console` drops directly into the Claude Code session.
+The `start-claude` script is also available as a manual command if needed.
 
 ### When Claude Code Exits
 
@@ -470,7 +467,7 @@ Key flags:
 - `--autostart=false` — don't start on network requests (no ports exposed anyway)
 - `--skip-dns-registration` — prevents discoverability via Fly's internal 6PN DNS, reinforcing the private-network iptables block
 
-Secrets (`GH_PAT`) are set once via `fly secrets set` on the app and automatically available to all machines.
+Secrets (`GH_PAT`, `CLAUDE_CODE_OAUTH_TOKEN`) are set once via `fly secrets set` on the app and automatically available to all machines.
 
 ## Project File Structure
 
@@ -489,6 +486,7 @@ claudetainer/
 │   ├── domains.conf           # Domain allowlist (one per line, shared by iptables + CoreDNS)
 │   ├── Corefile.template      # CoreDNS config template: base with NXDOMAIN default
 │   └── refresh-iptables.sh    # Cron script: re-resolves domains, atomic iptables-restore
+├── start-claude               # SSH login script: auth check, tmux creation, attach
 ├── status                     # CLI tool: shows active approvals, recent blocks, daemon health
 └── claude-settings.json       # Claude Code settings template (hook config + MCP)
 ```
@@ -548,7 +546,7 @@ claudetainer/
 | Claude uses `env` or `cat /proc/` to read secrets | `env` (bare) blocked; `/proc/` blocked anywhere in command; no secrets in Claude's env |
 | Claude uses `env VAR=val cmd` to bypass hook | `env` with arguments falls to default:block (no allow rule for env) |
 | Claude reaches other Fly machines | Fly private network ranges (fdaa::/16, 172.16.0.0/12) blocked in iptables |
-| Claude exfiltrates Anthropic credentials | Claude Code uses OAuth; tokens are session-scoped on tmpfs, lost on restart |
+| Claude exfiltrates Anthropic credentials | OAuth token is a Fly secret in root's env; claude user receives it only via start-claude at tmux launch |
 | Claude exfiltrates GitHub PAT | PAT in root-owned files (mode 600); readable via gh config (accepted risk — single-repo scope, can't reach non-allowlisted domains) |
 | Claude reads secrets from /proc | No secrets in Claude's environment; PAT only in root-owned files |
 | Claude runs `approve` via Bash tool | `block:^approve\b` in hook; `!` shell escape bypasses hooks (human-only) |

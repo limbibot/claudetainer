@@ -44,9 +44,8 @@ RUN ln -s /home/claude/.local/bin/claude /usr/local/bin/claude
 COPY start-claude /usr/local/bin/start-claude
 RUN chmod +x /usr/local/bin/start-claude
 
-# Auto-attach to existing tmux session on SSH login (if it exists)
-RUN echo 'export TERM=xterm-256color; if tmux -S /tmp/tmux-1000/default has-session -t claude 2>/dev/null; then exec tmux -S /tmp/tmux-1000/default attach -t claude; fi' \
-    >> /root/.bashrc
+# Run start-claude on SSH login (handles auth + tmux attach/create)
+RUN echo 'export TERM=xterm-256color; exec /usr/local/bin/start-claude' >> /root/.bashrc
 
 # Approval system
 COPY approval/ /opt/approval/
