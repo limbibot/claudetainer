@@ -35,6 +35,15 @@ if [[ -d /workspace/repo ]]; then
   WORK_DIR="/workspace/repo"
 fi
 
+# Install plugins (first run only — skips if already installed)
+echo "Installing plugins..."
+su -s /bin/bash claude -c "
+  export HOME=$CLAUDE_HOME
+  export PATH=$CLAUDE_HOME/.local/bin:$CLAUDE_HOME/.bun/bin:\$PATH
+  export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'
+  claude plugin install superpowers@claude-plugins-official 2>/dev/null
+" || echo "WARNING: Failed to install superpowers plugin"
+
 # Start Claude Code in tmux as the claude user
 su -s /bin/bash claude -c "
   export GH_CONFIG_DIR=/opt/gh-config
