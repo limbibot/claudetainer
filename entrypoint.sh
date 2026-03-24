@@ -108,7 +108,8 @@ echo "$GH_PAT" | gh auth login --with-token --hostname github.com 2>/dev/null ||
 
 # Configure git credential helper at system level so claude user can use it
 # gh auth setup-git only writes to ~/.gitconfig (root), so we set it explicitly
-git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
+# GH_CONFIG_DIR is hardcoded in the command so it works regardless of environment inheritance
+git config --system credential.https://github.com.helper '!GH_CONFIG_DIR=/opt/gh-config /usr/bin/gh auth git-credential'
 
 # Copy gh config to a shared location readable by claude user
 mkdir -p /opt/gh-config

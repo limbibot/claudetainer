@@ -79,6 +79,10 @@ COPY approval/ /opt/approval/
 RUN chmod +x /opt/approval/*.sh /opt/approval/approve
 RUN cp /opt/approval/approve /usr/local/bin/approve
 
+# gh wrapper (ensures GH_CONFIG_DIR is always set for Claude Code subprocesses)
+COPY gh-wrapper.sh /usr/local/bin/gh
+RUN chmod +x /usr/local/bin/gh
+
 # Network config
 COPY network/ /opt/network/
 RUN chmod +x /opt/network/refresh-iptables.sh
