@@ -33,6 +33,9 @@ set -g allow-passthrough on
 set -g aggressive-resize on
 set -sg escape-time 0
 set -g focus-events on
+set -ga terminal-features ",xterm-256color:clipboard:ccolour:cstyle:focus:overline:RGB:strikethrough:title:usstyle"
+set -ga terminal-overrides ",*:Smulx=\E[4::%p1%dm"
+set -ga terminal-overrides ",*:Setulc=\E[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m"
 TMUX
 
 # Determine working directory
@@ -56,6 +59,8 @@ su -s /bin/bash claude -c "
   export HOME=$CLAUDE_HOME
   export PATH=$CLAUDE_HOME/.local/bin:$CLAUDE_HOME/.bun/bin:\$PATH
   export CLAUDE_CODE_OAUTH_TOKEN='$CLAUDE_CODE_OAUTH_TOKEN'
+  export TERM=xterm-256color
+  export COLORTERM=truecolor
   cd '$WORK_DIR'
   tmux -f /tmp/.tmux.conf new-session -d -s claude 'claude --dangerously-skip-permissions'
 "
