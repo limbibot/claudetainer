@@ -25,6 +25,30 @@ chown claude:claude /workspace /home/claude
 mkdir -p /home/claude/.cache /home/claude/.claude /home/claude/.local/bin /home/claude/.bun/bin
 chown -R claude:claude /home/claude/.cache /home/claude/.claude /home/claude/.local /home/claude/.bun
 
+# Shell prompt: path relative to repo root + git branch
+cat > /home/claude/.bashrc <<'BASHRC'
+__ps1_path() {
+  local git_root
+  git_root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo '\w'; return; }
+  local repo_name=${git_root##*/}
+  local rel=${PWD#"$git_root"}
+  if [[ -z "$rel" ]]; then
+    echo "$repo_name"
+  else
+    echo "$repo_name$rel"
+  fi
+}
+__ps1_branch() {
+  git branch --show-current 2>/dev/null
+}
+PS1='\[\e[1;36m\]$(__ps1_path)\[\e[0m\] \[\e[1;33m\]($(__ps1_branch))\[\e[0m\]\n\$ '
+BASHRC
+chown claude:claude /home/claude/.bashrc
+
+# Ensure .bashrc is sourced by login shells (tmux panes use login shells)
+echo '[ -f ~/.bashrc ] && . ~/.bashrc' > /home/claude/.profile
+chown claude:claude /home/claude/.profile
+
 # Recreate expected binary paths (originals wiped by tmpfs mount)
 ln -sf /usr/local/bin/claude /home/claude/.local/bin/claude
 ln -sf /usr/local/bin/bun /home/claude/.bun/bin/bun
@@ -43,6 +67,7 @@ while IFS= read -r domain || [[ -n "$domain" ]]; do
   cat >> "$COREFILE" <<EOF
 
 ${domain} {
+    bind 127.0.0.53
     template IN AAAA {
         rcode NOERROR
     }
@@ -53,8 +78,12 @@ ${domain} {
 EOF
 done < /opt/network/domains.conf
 
-# Start CoreDNS
-/usr/local/bin/coredns -conf "$COREFILE" &
+# Start CoreDNS with auto-restart
+(while true; do
+  /usr/local/bin/coredns -conf "$COREFILE" >/tmp/coredns.log 2>&1
+  echo "[ENTRYPOINT] CoreDNS exited ($?), restarting in 2s..." >&2
+  sleep 2
+done) &
 sleep 1
 
 # Point resolver to local CoreDNS
@@ -71,9 +100,15 @@ echo "nameserver 127.0.0.53" > /etc/resolv.conf
 git config --system user.name "${GIT_USER_NAME:-claudetainer}"
 git config --system user.email "${GIT_USER_EMAIL:-claudetainer@noreply.github.com}"
 
-# Authenticate gh CLI with the PAT, then use gh as the git credential helper
+# Force HTTPS for all GitHub URLs (container has no SSH client)
+git config --system url."https://github.com/".insteadOf "git@github.com:"
+
+# Authenticate gh CLI with the PAT
 echo "$GH_PAT" | gh auth login --with-token --hostname github.com 2>/dev/null || true
-gh auth setup-git --hostname github.com 2>/dev/null || true
+
+# Configure git credential helper at system level so claude user can use it
+# gh auth setup-git only writes to ~/.gitconfig (root), so we set it explicitly
+git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
 
 # Copy gh config to a shared location readable by claude user
 mkdir -p /opt/gh-config
@@ -124,5 +159,6 @@ fi
 echo "[ENTRYPOINT] Ready. Waiting for SSH connections..."
 echo "[ENTRYPOINT] Run 'fly ssh console -a <app>' to connect."
 
-# Keep the container alive — SSH users get start-claude via .bashrc
-exec sleep infinity
+# Keep the container alive — bash stays as PID 1 to reap zombie children
+# (CoreDNS restart loop and iptables refresh loop are background subshells)
+wait

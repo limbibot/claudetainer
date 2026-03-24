@@ -3,6 +3,10 @@
 TMUX_SOCKET="/tmp/tmux-1000/default"
 CLAUDE_HOME="/home/claude"
 
+# Ensure UTF-8 locale for TUI rendering (box-drawing chars, logo, etc.)
+export LANG="${LANG:-en_US.UTF-8}"
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+
 # If tmux session already exists, just attach
 if tmux -S "$TMUX_SOCKET" has-session -t claude 2>/dev/null; then
   exec tmux -S "$TMUX_SOCKET" attach -t claude
@@ -21,19 +25,20 @@ if [[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
   exit 1
 fi
 
-# Write tmux config
+# Write tmux config (optimized for Claude Code TUI over SSH)
 cat > /tmp/.tmux.conf <<'TMUX'
 set -g status off
 set -g remain-on-exit off
-set -g history-limit 50000
 set -g default-terminal "tmux-256color"
-set -ga terminal-overrides ",xterm-256color:Tc"
-set -g mouse on
+set -ag terminal-overrides ",xterm-256color:RGB"
 set -g allow-passthrough on
-set -g aggressive-resize on
+set -g extended-keys on
+set -as terminal-features 'xterm*:extkeys'
 set -sg escape-time 0
+set -g set-clipboard on
+set -g history-limit 250000
 set -g focus-events on
-set -ga terminal-features ",xterm-256color:clipboard:ccolour:cstyle:focus:overline:RGB:strikethrough:title:usstyle"
+set -g mouse on
 set -ga terminal-overrides ",*:Smulx=\E[4::%p1%dm"
 set -ga terminal-overrides ",*:Setulc=\E[58::2::%p1%{65536}%/%d::%p1%{256}%/%{255}%&%d::%p1%{255}%&%d%;m"
 TMUX
@@ -44,12 +49,17 @@ if [[ -d /workspace/repo ]]; then
   WORK_DIR="/workspace/repo"
 fi
 
+
+echo "initializing claudetainer ..."
+
 # Install plugins (first run only)
-echo "Installing plugins..."
 sudo -u claude \
   HOME="$CLAUDE_HOME" \
   PATH="$CLAUDE_HOME/.local/bin:$CLAUDE_HOME/.bun/bin:$PATH" \
+  GH_CONFIG_DIR="/opt/gh-config" \
   CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+  LANG="$LANG" \
+  LC_ALL="$LC_ALL" \
   claude plugin install superpowers@claude-plugins-official 2>/dev/null \
   || echo "WARNING: Failed to install superpowers plugin"
 
@@ -59,11 +69,22 @@ sudo -u claude \
   PATH="$CLAUDE_HOME/.local/bin:$CLAUDE_HOME/.bun/bin:$PATH" \
   GH_CONFIG_DIR="/opt/gh-config" \
   CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
-  TERM="xterm-256color" \
   COLORTERM="truecolor" \
+  LANG="$LANG" \
+  LC_ALL="$LC_ALL" \
   tmux -f /tmp/.tmux.conf new-session -d -s claude \
     -c "$WORK_DIR" \
     "claude --dangerously-skip-permissions"
 
-# Attach
+# Add a terminal pane below Claude Code (20% height)
+sudo -u claude \
+  HOME="$CLAUDE_HOME" \
+  PATH="$CLAUDE_HOME/.local/bin:$CLAUDE_HOME/.bun/bin:$PATH" \
+  GH_CONFIG_DIR="/opt/gh-config" \
+  COLORTERM="truecolor" \
+  LANG="$LANG" \
+  LC_ALL="$LC_ALL" \
+  tmux -S "$TMUX_SOCKET" split-window -t claude -v -l 20% -c "$WORK_DIR" "bash --login -i"
+
+# Attach (focus stays on Claude Code pane)
 exec tmux -S "$TMUX_SOCKET" attach -t claude
