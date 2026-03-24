@@ -1,11 +1,6 @@
 {
   "includeCoAuthoredBy": false,
-  "mcpServers": {
-    "bun-docs": {
-      "type": "http",
-      "url": "https://bun.com/docs/mcp"
-    }
-  },
+  "model": "claude-opus-4-6",
   "hooks": {
     "PreToolUse": [
       {
