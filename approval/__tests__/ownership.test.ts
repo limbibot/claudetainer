@@ -262,4 +262,18 @@ describe("isOwnedRemotePush", () => {
     mockGitSpawn("alice", "https://github.com/victim-org/repo.git");
     expect(await isOwnedRemotePush("git push origin main")).toBe(false);
   });
+
+  // Regression: in the container, GIT_USER_NAME is only available during the
+  // entrypoint boot sequence. The approval process inherits git config (set via
+  // `git config --system user.name`) but NOT the env var. The ownership check
+  // must use `git config user.name`, not process.env.GIT_USER_NAME.
+  test("allows push when env var is unset but git config has correct owner", async () => {
+    delete process.env.GIT_USER_NAME;
+    mockGitSpawn("limbibot", "https://github.com/limbibot/claudetainer.git");
+    expect(
+      await isOwnedRemotePush(
+        "git push -u origin feat/claude-install-verification",
+      ),
+    ).toBe(true);
+  });
 });
