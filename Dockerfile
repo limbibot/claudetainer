@@ -108,6 +108,7 @@ RUN chmod +x /usr/local/bin/gh
 
 # Network config
 COPY network/ /opt/network/
+COPY scripts/refresh-iptables.sh /opt/network/refresh-iptables.sh
 RUN chmod +x /opt/network/refresh-iptables.sh
 
 # Claude settings template, statusline, and session namer
