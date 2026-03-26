@@ -34,9 +34,9 @@ RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin
 
 # glow (Markdown renderer — not in Debian repos)
 RUN ARCH=$(dpkg --print-architecture) \
-    && curl -fsSL "https://github.com/charmbracelet/glow/releases/download/v2.1.0/glow_2.1.0_linux_${ARCH}.tar.gz" \
-    | tar -xz -C /usr/local/bin/ glow \
-    && chmod +x /usr/local/bin/glow
+    && curl -fsSLo /tmp/glow.deb "https://github.com/charmbracelet/glow/releases/download/v2.1.1/glow_2.1.1_${ARCH}.deb" \
+    && dpkg -i /tmp/glow.deb \
+    && rm /tmp/glow.deb
 
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
