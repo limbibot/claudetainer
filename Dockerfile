@@ -2,8 +2,9 @@ FROM debian:bookworm-slim
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash ca-certificates curl dnsutils fd-find git iptables sudo \
+    bash bat ca-certificates curl dnsutils fd-find git iptables sudo \
     jq less locales python3 ripgrep tree unzip wget xxd \
+    && ln -s /usr/bin/batcat /usr/local/bin/bat \
     && rm -rf /var/lib/apt/lists/*
 
 # Generate UTF-8 locale (bookworm-slim strips locale data; needed for TUI rendering)
@@ -30,6 +31,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # just (not in Debian repos — install from official prebuilt binary)
 RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin
+
+# glow (Markdown renderer — not in Debian repos)
+RUN ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL "https://github.com/charmbracelet/glow/releases/download/v2.1.0/glow_2.1.0_linux_${ARCH}.tar.gz" \
+    | tar -xz -C /usr/local/bin/ glow \
+    && chmod +x /usr/local/bin/glow
 
 # gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
