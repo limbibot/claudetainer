@@ -59,7 +59,7 @@ ln -sf /usr/local/bin/bunx /home/claude/.bun/bin/bunx
 # === 2. Network lockdown ===
 
 # OTEL Phase 1: Extract Grafana Cloud hostname for network allowlisting
-# (Phase 2 exports the OTEL env vars later, after network setup is complete)
+# (Phase 2 later writes OTEL env vars to /tmp/otel/otel-env after network setup is complete)
 if [[ -n "${GRAFANA_INSTANCE_ID:-}" ]] && [[ -n "${GRAFANA_API_TOKEN:-}" ]] && [[ -n "${GRAFANA_OTLP_ENDPOINT:-}" ]]; then
   GRAFANA_HOST=$(echo "$GRAFANA_OTLP_ENDPOINT" | sed 's|https\?://||' | cut -d/ -f1 | cut -d: -f1)
   # Validate hostname: alphanumeric, hyphens, dots only (prevent Corefile injection)
