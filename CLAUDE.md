@@ -155,7 +155,7 @@ Container builds are manual. Never build or push Docker images.
 4. Start CoreDNS (DNS filtering, with Grafana host if set)
 5. Apply iptables (network isolation, with Grafana host if set)
 6. Configure git/gh/npm auth (credential setup)
-7. Export OTEL env vars (if Grafana credentials set)
+7. Write OTEL env file (if Grafana credentials set)
 8. Copy Claude settings
 9. Remount rootfs read-only
 10. Clone repo
