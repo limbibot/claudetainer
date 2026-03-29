@@ -211,13 +211,14 @@ See [Telemetry](#telemetry-optional) below for what gets exported and privacy co
 
 These are set via `--env` flags on `fly machine run`. They are not sensitive and don't need to be secrets.
 
-| Variable                | Required | Default                           | Description                                                                                                                                       |
-| ----------------------- | -------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GIT_USER_NAME`         | No       | `claudetainer`                    | Git commit author name. **Must match the GitHub username/login** (not a display name) for the git push ownership exemption to work.               |
-| `GIT_USER_EMAIL`        | No       | `claudetainer@noreply.github.com` | Git commit author email                                                                                                                           |
-| `REPO_URL`              | No       | _(none)_                          | HTTPS URL of a GitHub repo to clone on startup. Cloned to `/workspace/repo`. Must be accessible with the `GH_PAT`.                                |
-| `OTEL_LOG_USER_PROMPTS` | No       | `1`                               | Set to `0` to exclude user prompt content from telemetry events (only prompt length is recorded). Requires Grafana Cloud telemetry to be enabled. |
-| `OTEL_LOG_TOOL_DETAILS` | No       | `1`                               | Set to `0` to exclude tool parameters from telemetry events (only tool name is recorded). Requires Grafana Cloud telemetry to be enabled.         |
+| Variable                   | Required | Default                           | Description                                                                                                                                                                                             |
+| -------------------------- | -------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GIT_USER_NAME`            | No       | `claudetainer`                    | Git commit author name. **Must match the GitHub username/login** (not a display name) for the git push ownership exemption to work.                                                                     |
+| `GIT_USER_EMAIL`           | No       | `claudetainer@noreply.github.com` | Git commit author email                                                                                                                                                                                 |
+| `REPO_URL`                 | No       | _(none)_                          | HTTPS URL of a GitHub repo to clone on startup. Cloned to `/workspace/repo`. Must be accessible with the `GH_PAT`.                                                                                      |
+| `OTEL_LOG_USER_PROMPTS`    | No       | `1`                               | Set to `0` to exclude user prompt content from telemetry events (only prompt length is recorded). Requires Grafana Cloud telemetry to be enabled.                                                       |
+| `OTEL_LOG_TOOL_DETAILS`    | No       | `1`                               | Set to `0` to exclude tool parameters from telemetry events (only tool name is recorded). Requires Grafana Cloud telemetry to be enabled.                                                               |
+| `OTEL_RESOURCE_ATTRIBUTES` | No       | _(auto: Fly identity)_            | Comma-separated `key=value` pairs added to all metrics and events. `fly.app_name` and `fly.machine_id` are auto-injected; operator values are appended. Requires Grafana Cloud telemetry to be enabled. |
 
 ## Usage
 
@@ -309,6 +310,26 @@ fly machine run ... \
 With `OTEL_LOG_USER_PROMPTS=0`, only prompt length is recorded (not content). With `OTEL_LOG_TOOL_DETAILS=0`, only tool names are recorded (not parameters). Raw file contents are never included regardless of settings.
 
 **Data residency note:** When enabled, telemetry data (including prompt content if not opted out) leaves the container and is stored in Grafana Cloud. You are responsible for ensuring this meets your data residency and privacy requirements.
+
+### Resource attributes
+
+All metrics and events are tagged with resource attributes for filtering and grouping in Grafana dashboards.
+
+**Auto-injected** (always present when telemetry is enabled):
+
+- `fly.app_name` — from the Fly VM's `FLY_APP_NAME` env var
+- `fly.machine_id` — from the Fly VM's `FLY_MACHINE_ID` env var
+
+**Custom attributes** — add your own via the `OTEL_RESOURCE_ATTRIBUTES` env var:
+
+```bash
+fly machine run ... \
+  --env OTEL_RESOURCE_ATTRIBUTES="department=engineering,team.id=platform,cost_center=eng-123"
+```
+
+The auto-injected Fly attributes and your custom attributes are merged. If you set a key that conflicts with an auto-injected one, your value wins (last-write-wins).
+
+Values must not contain spaces. Use underscores or camelCase instead (e.g., `team.name=my_team`).
 
 ### How it works
 
